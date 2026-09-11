@@ -579,7 +579,7 @@ if "logged_in" not in st.session_state:
 def login():
     st.markdown("""
     <div class="main-header">
-        <h1 style="font-size: 2.5rem; margin: 0;">🚦 Toll Operations</h1>
+        <h1 style="font-size: 2.5rem; margin: 0;">🚦Modjo - Hawassa Toll Operations</h1>
         <p style="font-size: 1rem; margin: 0.2rem 0 0 0;">Shift Report System</p>
     </div>
     """, unsafe_allow_html=True)
