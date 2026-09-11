@@ -16,7 +16,7 @@ import io
 
 # -------------------- PAGE CONFIG --------------------
 st.set_page_config(
-    page_title="🚦 Toll Operations",
+    page_title="🚦Modjo-Hawassa Toll Operations",
     page_icon="🚦",
     layout="wide"
 )
