@@ -1,2183 +1,1705 @@
 """
-Toll Operations Manager - Complete Application with Audit Log
-Single File: toll_operations.py
+Toll Operations Manager  (v2)
+Single file: toll_operations.py
+
+Run:   streamlit run toll_operations.py
+Needs: streamlit>=1.37, pandas, plotly, pillow
 """
 
-import streamlit as st
-import pandas as pd
-import sqlite3
-import hashlib
-from datetime import datetime, date, timedelta
-import plotly.express as px
-import os
 import base64
-from PIL import Image
+import hashlib
+import hmac
+import html
 import io
+import os
+import re
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 
-# -------------------- PAGE CONFIG --------------------
-st.set_page_config(
-    page_title="🚦 Toll Operations",
-    page_icon="🚦",
-    layout="wide"
-)
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from PIL import Image
 
-# -------------------- SIMPLE CSS --------------------
-st.markdown("""
-<style>
-    .stApp { background: #f5f7fa; }
-    .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem; border-radius: 10px; color: white;
-        margin-bottom: 1.5rem; text-align: center;
-    }
-    .manager-header {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        padding: 1.5rem; border-radius: 10px; color: white;
-        margin-bottom: 1.5rem; text-align: center;
-    }
-    .stButton > button {
-        background: #667eea; color: white; border: none;
-        border-radius: 20px; font-weight: bold;
-    }
-    .stButton > button:hover { background: #764ba2; }
-    .stForm {
-        background: white; padding: 1.5rem; border-radius: 15px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-    }
-    .metric-card {
-        background: white; padding: 15px; border-radius: 10px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-        border-left: 4px solid #667eea; text-align: center;
-    }
-    .footer {
-        text-align: center; padding: 1rem; color: #999;
-        font-size: 0.8rem; border-top: 1px solid #ddd; margin-top: 2rem;
-    }
-    .badge {
-        display: inline-block; padding: 0.2rem 0.6rem;
-        border-radius: 15px; font-size: 0.7rem; font-weight: bold;
-    }
-    .badge-manager { background: #f5576c; color: white; }
-    .badge-supervisor { background: #667eea; color: white; }
-    .badge-active { background: #4CAF50; color: white; }
-    .badge-inactive { background: #999; color: white; }
-    .settled-box {
-        background: #fff3cd; padding: 1.5rem; border-radius: 10px;
-        border-left: 4px solid #ffc107; text-align: center;
-    }
-    .settled-box h3 { color: #856404; margin: 0; }
-    .settled-box p { color: #856404; margin: 0.5rem 0 0 0; }
-    .log-entry {
-        background: white; padding: 0.6rem 1rem; border-radius: 8px;
-        margin-bottom: 0.4rem; border-left: 3px solid #667eea;
-        font-size: 0.85rem;
-    }
-    .log-action-create { border-left-color: #4CAF50; }
-    .log-action-update { border-left-color: #FF9800; }
-    .log-action-delete { border-left-color: #f44336; }
-    .log-action-login { border-left-color: #2196F3; }
-    .log-action-settle { border-left-color: #9C27B0; }
-</style>
-""", unsafe_allow_html=True)
+# -------------------- PAGE CONFIG (must be first st call) --------------------
+st.set_page_config(page_title="Toll Operations", page_icon="🚦", layout="wide")
 
 # -------------------- CONSTANTS --------------------
+DB_FILE = os.environ.get("TOLL_DB", "toll_operations.db")
 STATIONS = ["Modjo East", "Koka", "Bote", "Meki", "Batu"]
+ALL_STATIONS = "All Stations"
 SHIFTS = ["A", "B", "C"]
 VEHICLE_TYPES = ["V1", "V2", "V3", "V4", "V5", "V6", "V7"]
+MIN_PASSWORD = 6
+PBKDF2_ITERS = 200_000
+MAX_FAILED_LOGINS = 5
+LOCKOUT_MINUTES = 15
 
-# -------------------- DATABASE --------------------
-DB_FILE = "toll_operations.db"
+INT_FIELDS = [
+    "exit_sys", "entry_sys", "exit_man", "entry_man", "exit_etc", "entry_etc",
+    "thermal_exit", "thermal_entry", "no_card", "forged_count", "overload_count",
+]
+FLOAT_FIELDS = [
+    "cash_sys", "cash_man", "etc", "gen_fuel", "veh_fuel", "veh_odo",
+    "forged_amt", "overload_amt", "gen_hour",
+]
+NUM_FIELDS = INT_FIELDS + FLOAT_FIELDS
+TEXT_FIELDS = ["gen_operator", "gen_remark", "good_notes", "problems", "solution"]
 
-def init_database():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # USERS TABLE
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fname TEXT NOT NULL,
-            lname TEXT NOT NULL,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            station TEXT NOT NULL,
-            role TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP
-        )
-    ''')
-    
-    # REPORTS TABLE
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            report_date DATE,
-            shift TEXT,
-            timestamp TIMESTAMP NOT NULL,
-            supervisor TEXT NOT NULL,
-            station TEXT NOT NULL,
-            exit_sys INTEGER DEFAULT 0,
-            entry_sys INTEGER DEFAULT 0,
-            exit_man INTEGER DEFAULT 0,
-            entry_man INTEGER DEFAULT 0,
-            exit_etc INTEGER DEFAULT 0,
-            entry_etc INTEGER DEFAULT 0,
-            cash_sys REAL DEFAULT 0,
-            cash_man REAL DEFAULT 0,
-            etc REAL DEFAULT 0,
-            thermal_in INTEGER DEFAULT 0,
-            thermal_out INTEGER DEFAULT 0,
-            gen_fuel REAL DEFAULT 0,
-            veh_fuel REAL DEFAULT 0,
-            no_card INTEGER DEFAULT 0,
-            forged_count INTEGER DEFAULT 0,
-            forged_amt REAL DEFAULT 0,
-            overload_count INTEGER DEFAULT 0,
-            overload_amt REAL DEFAULT 0,
-            gen_hour REAL DEFAULT 0,
-            good_notes TEXT,
-            problems TEXT,
-            solution TEXT,
-            is_settled INTEGER DEFAULT 0,
-            settled_at TIMESTAMP,
-            settled_by TEXT,
-            UNIQUE(station, report_date, shift)
-        )
-    ''')
-    
-    # UNPAID VEHICLES
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS unpaid_vehicles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vehicle_number TEXT NOT NULL,
-            vehicle_type TEXT,
-            station TEXT NOT NULL,
-            report_date DATE NOT NULL,
-            shift TEXT NOT NULL,
-            supervisor TEXT NOT NULL,
-            amount REAL DEFAULT 0,
-            reason TEXT,
-            status TEXT DEFAULT 'unpaid',
-            paid_date DATE,
-            image_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # AUDIT LOG TABLE
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            username TEXT NOT NULL,
-            role TEXT,
-            action TEXT NOT NULL,
-            target_type TEXT,
-            target_id TEXT,
-            target_name TEXT,
-            details TEXT,
-            station TEXT,
-            ip_address TEXT
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+# Traffic = system + ETC + manual lanes, entry and exit.
+TRAFFIC_COLS = ["exit_sys", "entry_sys", "exit_etc", "entry_etc", "exit_man", "entry_man"]
+REVENUE_COLS = ["cash_sys", "cash_man", "etc"]
+FUEL_COLS = ["gen_fuel", "veh_fuel"]
 
-def migrate_database():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # Check users columns
-    cursor.execute("PRAGMA table_info(users)")
-    user_cols = [column[1] for column in cursor.fetchall()]
-    
-    if 'fname' not in user_cols:
-        try:
-            cursor.execute('ALTER TABLE users ADD COLUMN fname TEXT DEFAULT ""')
-        except:
-            pass
-    if 'lname' not in user_cols:
-        try:
-            cursor.execute('ALTER TABLE users ADD COLUMN lname TEXT DEFAULT ""')
-        except:
-            pass
-    if 'is_active' not in user_cols:
-        try:
-            cursor.execute('ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1')
-        except:
-            pass
-    if 'updated_at' not in user_cols:
-        try:
-            cursor.execute('ALTER TABLE users ADD COLUMN updated_at TIMESTAMP')
-        except:
-            pass
-    
-    # Check reports columns
-    cursor.execute("PRAGMA table_info(reports)")
-    report_cols = [column[1] for column in cursor.fetchall()]
-    
-    if 'is_settled' not in report_cols:
-        try:
-            cursor.execute('ALTER TABLE reports ADD COLUMN is_settled INTEGER DEFAULT 0')
-        except:
-            pass
-    if 'settled_at' not in report_cols:
-        try:
-            cursor.execute('ALTER TABLE reports ADD COLUMN settled_at TIMESTAMP')
-        except:
-            pass
-    if 'settled_by' not in report_cols:
-        try:
-            cursor.execute('ALTER TABLE reports ADD COLUMN settled_by TEXT')
-        except:
-            pass
-    
-    # Check unpaid_vehicles
-    cursor.execute("PRAGMA table_info(unpaid_vehicles)")
-    unpaid_cols = [column[1] for column in cursor.fetchall()]
-    if 'image_data' not in unpaid_cols:
-        try:
-            cursor.execute('ALTER TABLE unpaid_vehicles ADD COLUMN image_data TEXT')
-        except:
-            pass
-    
-    conn.commit()
-    conn.close()
+# -------------------- STYLE (theme-neutral: works in light and dark) --------------------
+st.markdown(
+    """
+<style>
+    .page-header {
+        padding: 1.2rem 1.5rem; border-radius: 12px; color: white;
+        margin-bottom: 1rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    .page-header.manager { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
+    .page-header h1 { margin: 0; padding: 0; font-size: 1.8rem; color: white; }
+    .page-header p { margin: 0.2rem 0 0 0; opacity: 0.9; }
+    .locked-box {
+        padding: 1.2rem; border-radius: 12px; text-align: center;
+        background: rgba(255, 193, 7, 0.15); border-left: 4px solid #ffc107;
+    }
+    .block-container { padding-top: 2rem; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
 
-def create_admin_user():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', ('admin',))
-    if cursor.fetchone()[0] == 0:
-        cursor.execute('''
-            INSERT INTO users (fname, lname, username, password_hash, station, role, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', ('System', 'Admin', 'admin', hash_password('admin123'), 'All Stations', 'manager', 1))
-    conn.commit()
-    conn.close()
+def header(title: str, subtitle: str = "", manager: bool = False):
+    cls = "page-header manager" if manager else "page-header"
+    st.markdown(
+        f'<div class="{cls}"><h1>{html.escape(title)}</h1>'
+        f"<p>{html.escape(subtitle)}</p></div>",
+        unsafe_allow_html=True,
+    )
 
-# -------------------- AUDIT LOG --------------------
-def log_action(username, role, action, target_type=None, target_id=None, target_name=None, details=None, station=None):
-    """Log an action to the audit log"""
+
+# ===================================================================
+# DATABASE
+# ===================================================================
+@contextmanager
+def db():
+    """Connection that commits on success, rolls back on error, always closes."""
+    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO audit_log (username, role, action, target_type, target_id, target_name, details, station)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (username, role, action, target_type, str(target_id) if target_id else None, 
-              target_name, details, station))
+        yield conn
         conn.commit()
-        conn.close()
-    except Exception as e:
-        pass  # Silent fail - don't break app if logging fails
-
-def get_audit_log(limit=200, username=None, action=None, start_date=None, end_date=None):
-    """Get audit log entries"""
-    conn = sqlite3.connect(DB_FILE)
-    query = 'SELECT * FROM audit_log WHERE 1=1'
-    params = []
-    
-    if username:
-        query += ' AND username = ?'
-        params.append(username)
-    if action:
-        query += ' AND action = ?'
-        params.append(action)
-    if start_date:
-        query += ' AND DATE(timestamp) >= ?'
-        params.append(start_date)
-    if end_date:
-        query += ' AND DATE(timestamp) <= ?'
-        params.append(end_date)
-    
-    query += ' ORDER BY timestamp DESC LIMIT ?'
-    params.append(limit)
-    
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
-
-# -------------------- USER FUNCTIONS --------------------
-def get_user(username):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, fname, lname, username, password_hash, station, role, is_active 
-        FROM users WHERE username = ?
-    ''', (username,))
-    user = cursor.fetchone()
-    conn.close()
-    if user:
-        return {
-            "id": user[0], "fname": user[1], "lname": user[2],
-            "username": user[3], "password_hash": user[4],
-            "station": user[5], "role": user[6], "is_active": user[7]
-        }
-    return None
-
-def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query('''
-        SELECT id, fname, lname, username, station, role, is_active, created_at, updated_at
-        FROM users ORDER BY is_active DESC, username
-    ''', conn)
-    conn.close()
-    return df
-
-def check_username_exists(username, exclude_id=None):
-    """Check if username exists (excluding a specific ID for edits)"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    if exclude_id:
-        cursor.execute('SELECT COUNT(*) FROM users WHERE username = ? AND id != ?', (username, exclude_id))
-    else:
-        cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', (username,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count > 0
-
-def create_user(fname, lname, username, password, station, role, admin_username, admin_role):
-    """Create a new user"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO users (fname, lname, username, password_hash, station, role, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
-        ''', (fname, lname, username, hash_password(password), station, role))
-        user_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        log_action(admin_username, admin_role, "CREATE_USER", "USER", user_id, username,
-                   f"Created {role}: {fname} {lname} ({username}) at {station}")
-        return True, user_id
-    except sqlite3.IntegrityError:
-        return False, "Username already exists"
-    except Exception as e:
-        return False, str(e)
-
-def update_user(user_id, fname, lname, username, station, role, new_password, admin_username, admin_role):
-    """Update existing user"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        # Get old values for audit
-        cursor.execute('SELECT fname, lname, username, station, role FROM users WHERE id = ?', (user_id,))
-        old = cursor.fetchone()
-        
-        if new_password:
-            cursor.execute('''
-                UPDATE users SET fname = ?, lname = ?, username = ?, station = ?, 
-                                 role = ?, password_hash = ?, updated_at = ?
-                WHERE id = ?
-            ''', (fname, lname, username, station, role, hash_password(new_password),
-                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id))
-            pw_note = " (password changed)"
-        else:
-            cursor.execute('''
-                UPDATE users SET fname = ?, lname = ?, username = ?, station = ?, 
-                                 role = ?, updated_at = ?
-                WHERE id = ?
-            ''', (fname, lname, username, station, role,
-                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id))
-            pw_note = ""
-        
-        conn.commit()
-        conn.close()
-        
-        details = f"Updated user: {old[0]} {old[1]} ({old[2]}) → {fname} {lname} ({username}){pw_note}"
-        log_action(admin_username, admin_role, "UPDATE_USER", "USER", user_id, username, details)
-        return True, "User updated"
-    except sqlite3.IntegrityError:
-        return False, "Username already exists"
-    except Exception as e:
-        return False, str(e)
-
-def toggle_user_status(user_id, is_active, admin_username, admin_role):
-    """Activate or deactivate a user"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('SELECT fname, lname, username FROM users WHERE id = ?', (user_id,))
-        user = cursor.fetchone()
-        
-        if not user:
-            conn.close()
-            return False, "User not found"
-        
-        cursor.execute('''
-            UPDATE users SET is_active = ?, updated_at = ?
-            WHERE id = ?
-        ''', (1 if is_active else 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user_id))
-        conn.commit()
-        conn.close()
-        
-        action = "ACTIVATE_USER" if is_active else "DEACTIVATE_USER"
-        status_text = "activated" if is_active else "deactivated"
-        log_action(admin_username, admin_role, action, "USER", user_id, user[2],
-                   f"{status_text.title()} user: {user[0]} {user[1]} ({user[2]})")
-        return True, f"User {status_text}"
-    except Exception as e:
-        return False, str(e)
-
-def update_password(username, new_password):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users SET password_hash = ?, updated_at = ?
-        WHERE username = ?
-    ''', (hash_password(new_password), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username))
-    conn.commit()
-    conn.close()
-
-# -------------------- REPORT FUNCTIONS --------------------
-def save_report(record, username="", role=""):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            SELECT id, is_settled FROM reports 
-            WHERE station = ? AND report_date = ? AND shift = ?
-        ''', (record['station'], record['report_date'], record['shift']))
-        result = cursor.fetchone()
-        
-        if result:
-            if result[1] == 1:
-                conn.close()
-                return "settled"
-            
-            cursor.execute('''
-                UPDATE reports SET
-                    timestamp = ?, supervisor = ?,
-                    exit_sys = ?, entry_sys = ?, exit_man = ?, entry_man = ?,
-                    exit_etc = ?, entry_etc = ?,
-                    cash_sys = ?, cash_man = ?, etc = ?,
-                    thermal_in = ?, thermal_out = ?,
-                    gen_fuel = ?, veh_fuel = ?,
-                    no_card = ?,
-                    forged_count = ?, forged_amt = ?,
-                    overload_count = ?, overload_amt = ?,
-                    gen_hour = ?,
-                    good_notes = ?, problems = ?, solution = ?
-                WHERE station = ? AND report_date = ? AND shift = ?
-            ''', (
-                record['timestamp'], record['supervisor'],
-                record['exit_sys'], record['entry_sys'], record['exit_man'], record['entry_man'],
-                record['exit_etc'], record['entry_etc'],
-                record['cash_sys'], record['cash_man'], record['etc'],
-                record['thermal_in'], record['thermal_out'],
-                record['gen_fuel'], record['veh_fuel'],
-                record['no_card'],
-                record['forged_count'], record['forged_amt'],
-                record['overload_count'], record['overload_amt'],
-                record['gen_hour'],
-                record['good_notes'], record['problems'], record['solution'],
-                record['station'], record['report_date'], record['shift']
-            ))
-            conn.commit()
-            log_action(username, role, "UPDATE_REPORT", "REPORT", result[0],
-                       f"{record['station']} {record['report_date']} Shift {record['shift']}",
-                       "Updated shift report", record['station'])
-            return "updated"
-        else:
-            cursor.execute('''
-                INSERT INTO reports (
-                    report_date, shift, timestamp, supervisor, station, 
-                    exit_sys, entry_sys, exit_man, entry_man, exit_etc, entry_etc,
-                    cash_sys, cash_man, etc, thermal_in, thermal_out, gen_fuel, veh_fuel,
-                    no_card, forged_count, forged_amt, overload_count, overload_amt, gen_hour,
-                    good_notes, problems, solution, is_settled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                record['report_date'], record['shift'], record['timestamp'], 
-                record['supervisor'], record['station'],
-                record['exit_sys'], record['entry_sys'], record['exit_man'], record['entry_man'],
-                record['exit_etc'], record['entry_etc'],
-                record['cash_sys'], record['cash_man'], record['etc'],
-                record['thermal_in'], record['thermal_out'],
-                record['gen_fuel'], record['veh_fuel'],
-                record['no_card'],
-                record['forged_count'], record['forged_amt'],
-                record['overload_count'], record['overload_amt'],
-                record['gen_hour'],
-                record['good_notes'], record['problems'], record['solution'],
-                0
-            ))
-            report_id = cursor.lastrowid
-            conn.commit()
-            log_action(username, role, "CREATE_REPORT", "REPORT", report_id,
-                       f"{record['station']} {record['report_date']} Shift {record['shift']}",
-                       "Submitted new shift report", record['station'])
-            return "inserted"
-    except Exception as e:
-        return "error"
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
-def settle_report(report_id, admin_username, admin_role="manager"):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT station, report_date, shift FROM reports WHERE id = ?', (report_id,))
-    row = cursor.fetchone()
-    
-    cursor.execute('''
-        UPDATE reports 
-        SET is_settled = 1, settled_at = ?, settled_by = ?
-        WHERE id = ?
-    ''', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), admin_username, report_id))
-    conn.commit()
-    conn.close()
-    
-    if row:
-        log_action(admin_username, admin_role, "SETTLE_REPORT", "REPORT", report_id,
-                   f"{row[0]} {row[1]} Shift {row[2]}", "Settled shift", row[0])
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fname TEXT NOT NULL DEFAULT '',
+    lname TEXT NOT NULL DEFAULT '',
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    station TEXT NOT NULL,
+    role TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    must_change_password INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date DATE,
+    shift TEXT,
+    timestamp TIMESTAMP NOT NULL,
+    supervisor TEXT NOT NULL,
+    station TEXT NOT NULL,
+    exit_sys INTEGER DEFAULT 0, entry_sys INTEGER DEFAULT 0,
+    exit_man INTEGER DEFAULT 0, entry_man INTEGER DEFAULT 0,
+    exit_etc INTEGER DEFAULT 0, entry_etc INTEGER DEFAULT 0,
+    cash_sys REAL DEFAULT 0, cash_man REAL DEFAULT 0, etc REAL DEFAULT 0,
+    thermal_in INTEGER DEFAULT 0, thermal_out INTEGER DEFAULT 0,
+    thermal_exit INTEGER DEFAULT 0, thermal_entry INTEGER DEFAULT 0,
+    gen_fuel REAL DEFAULT 0, gen_operator TEXT, gen_remark TEXT,
+    veh_fuel REAL DEFAULT 0, veh_odo REAL DEFAULT 0,
+    no_card INTEGER DEFAULT 0,
+    forged_count INTEGER DEFAULT 0, forged_amt REAL DEFAULT 0,
+    overload_count INTEGER DEFAULT 0, overload_amt REAL DEFAULT 0,
+    gen_hour REAL DEFAULT 0,
+    good_notes TEXT, problems TEXT, solution TEXT,
+    is_settled INTEGER DEFAULT 0,
+    settled_at TIMESTAMP,
+    settled_by TEXT,
+    UNIQUE(station, report_date, shift)
+);
+CREATE TABLE IF NOT EXISTS unpaid_vehicles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vehicle_number TEXT NOT NULL,
+    vehicle_type TEXT,
+    station TEXT NOT NULL,
+    report_date DATE NOT NULL,
+    shift TEXT NOT NULL,
+    supervisor TEXT NOT NULL,
+    amount REAL DEFAULT 0,
+    reason TEXT,
+    status TEXT DEFAULT 'unpaid',
+    paid_date DATE,
+    image_data TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    username TEXT NOT NULL,
+    role TEXT,
+    action TEXT NOT NULL,
+    target_type TEXT,
+    target_id TEXT,
+    target_name TEXT,
+    details TEXT,
+    station TEXT,
+    ip_address TEXT
+);
+"""
+
+# Columns older versions of the database may be missing.
+MIGRATIONS = {
+    "users": {
+        "fname": "TEXT DEFAULT ''",
+        "lname": "TEXT DEFAULT ''",
+        "is_active": "INTEGER DEFAULT 1",
+        "must_change_password": "INTEGER DEFAULT 0",
+        "updated_at": "TIMESTAMP",
+    },
+    "reports": {
+        "thermal_exit": "INTEGER DEFAULT 0",
+        "thermal_entry": "INTEGER DEFAULT 0",
+        "gen_operator": "TEXT",
+        "gen_remark": "TEXT",
+        "veh_odo": "REAL DEFAULT 0",
+        "is_settled": "INTEGER DEFAULT 0",
+        "settled_at": "TIMESTAMP",
+        "settled_by": "TEXT",
+    },
+    "unpaid_vehicles": {"image_data": "TEXT"},
+}
+
+INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)",
+    "CREATE INDEX IF NOT EXISTS idx_reports_station ON reports(station, report_date)",
+    "CREATE INDEX IF NOT EXISTS idx_unpaid_station ON unpaid_vehicles(station, report_date)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username, action)",
+]
+
+
+# -------------------- PASSWORDS --------------------
+def hash_password(password: str) -> str:
+    """Salted PBKDF2. Format: pbkdf2$iterations$salt$hash"""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), PBKDF2_ITERS).hex()
+    return f"pbkdf2${PBKDF2_ITERS}${salt}${digest}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, iters, salt, digest = stored.split("$")
+            calc = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iters)).hex()
+            return hmac.compare_digest(calc, digest)
+        except ValueError:
+            return False
+    # Legacy unsalted SHA-256 (from the original app); upgraded on next login.
+    return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored)
+
+
+def setup_database():
+    with db() as conn:
+        conn.executescript(SCHEMA)
+        for table, cols in MIGRATIONS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in cols.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        for stmt in INDEXES:
+            conn.execute(stmt)
+        if not conn.execute("SELECT 1 FROM users WHERE username = 'admin'").fetchone():
+            conn.execute(
+                """INSERT INTO users (fname, lname, username, password_hash, station, role,
+                                      is_active, must_change_password)
+                   VALUES ('System', 'Admin', 'admin', ?, ?, 'manager', 1, 1)""",
+                (hash_password("admin123"), ALL_STATIONS),
+            )
+
+
+@st.cache_resource
+def init_once():
+    setup_database()
     return True
 
-def unsettle_report(report_id, admin_username="", admin_role="manager"):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT station, report_date, shift FROM reports WHERE id = ?', (report_id,))
-    row = cursor.fetchone()
-    
-    cursor.execute('''
-        UPDATE reports 
-        SET is_settled = 0, settled_at = NULL, settled_by = NULL
-        WHERE id = ?
-    ''', (report_id,))
-    conn.commit()
-    conn.close()
-    
-    if row and admin_username:
-        log_action(admin_username, admin_role, "UNSETTLE_REPORT", "REPORT", report_id,
-                   f"{row[0]} {row[1]} Shift {row[2]}", "Unsettled shift", row[0])
-    return True
 
-def get_report_status(report_date, shift, station):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT COUNT(*), COALESCE(MAX(is_settled), 0) FROM reports 
-        WHERE report_date = ? AND shift = ? AND station = ?
-    ''', (report_date, shift, station))
-    result = cursor.fetchone()
-    conn.close()
-    exists = result[0] > 0
-    is_settled = result[1] == 1 if exists else False
-    return exists, is_settled
+# -------------------- AUDIT LOG --------------------
+def actor():
+    u = st.session_state.get("_user")
+    return (u["username"], u["role"]) if u else ("anonymous", None)
 
-def get_reports(station=None, start_date=None, end_date=None, shift=None):
-    conn = sqlite3.connect(DB_FILE)
-    query = 'SELECT * FROM reports WHERE 1=1'
-    params = []
-    if station and station != "All Stations":
-        query += ' AND station = ?'
+
+def log_action(who, action, target_type=None, target_id=None, target_name=None,
+               details=None, station=None, conn=None):
+    username, role = who
+    sql = """INSERT INTO audit_log
+             (timestamp, username, role, action, target_type, target_id, target_name, details, station)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+    args = (now_str(), username, role, action, target_type,
+            None if target_id is None else str(target_id), target_name, details, station)
+    try:
+        if conn is not None:
+            conn.execute(sql, args)
+        else:
+            with db() as c:
+                c.execute(sql, args)
+    except sqlite3.Error:
+        pass  # never break the app because logging failed
+
+
+def get_audit_log(limit=200, username=None, action=None, start_date=None, end_date=None):
+    query, params = "SELECT * FROM audit_log WHERE 1=1", []
+    if username:
+        query += " AND username = ?"
+        params.append(username)
+    if action:
+        query += " AND action = ?"
+        params.append(action)
+    if start_date:
+        query += " AND DATE(timestamp) >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND DATE(timestamp) <= ?"
+        params.append(end_date)
+    query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+    params.append(limit)
+    with db() as conn:
+        return pd.read_sql_query(query, conn, params=params)
+
+
+def recent_failed_logins(username: str) -> int:
+    cutoff = (datetime.now() - timedelta(minutes=LOCKOUT_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM audit_log
+               WHERE action = 'LOGIN_FAILED' AND username = ? AND timestamp >= ?
+                 AND timestamp > COALESCE((SELECT MAX(timestamp) FROM audit_log
+                                           WHERE action = 'LOGIN' AND username = ?), '')""",
+            (username, cutoff, username),
+        ).fetchone()
+    return row[0]
+
+
+# -------------------- USERS --------------------
+def get_user(username=None, user_id=None):
+    with db() as conn:
+        if user_id is not None:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_all_users() -> pd.DataFrame:
+    with db() as conn:
+        return pd.read_sql_query(
+            """SELECT id, fname, lname, username, station, role, is_active, created_at, updated_at
+               FROM users ORDER BY is_active DESC, username""",
+            conn,
+        )
+
+
+def username_taken(username: str, exclude_id=None) -> bool:
+    with db() as conn:
+        if exclude_id:
+            row = conn.execute("SELECT 1 FROM users WHERE username = ? AND id != ?",
+                               (username, exclude_id)).fetchone()
+        else:
+            row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+    return row is not None
+
+
+def create_user(fname, lname, username, password, station, role, who):
+    try:
+        with db() as conn:
+            cur = conn.execute(
+                """INSERT INTO users (fname, lname, username, password_hash, station, role,
+                                      is_active, must_change_password)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, 1)""",
+                (fname, lname, username, hash_password(password), station, role),
+            )
+            log_action(who, "CREATE_USER", "USER", cur.lastrowid, username,
+                       f"Created {role}: {fname} {lname} ({username}) at {station}", conn=conn)
+        return True, "User created"
+    except sqlite3.IntegrityError:
+        return False, "Username already exists"
+    except sqlite3.Error as e:
+        return False, str(e)
+
+
+def update_user(user_id, fname, lname, username, station, role, new_password, who):
+    try:
+        with db() as conn:
+            old = conn.execute("SELECT fname, lname, username FROM users WHERE id = ?",
+                               (user_id,)).fetchone()
+            if not old:
+                return False, "User not found"
+            if new_password:
+                conn.execute(
+                    """UPDATE users SET fname=?, lname=?, username=?, station=?, role=?,
+                              password_hash=?, must_change_password=1, updated_at=? WHERE id=?""",
+                    (fname, lname, username, station, role, hash_password(new_password), now_str(), user_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE users SET fname=?, lname=?, username=?, station=?, role=?,
+                              updated_at=? WHERE id=?""",
+                    (fname, lname, username, station, role, now_str(), user_id),
+                )
+            note = " (password reset)" if new_password else ""
+            log_action(who, "UPDATE_USER", "USER", user_id, username,
+                       f"{old['fname']} {old['lname']} ({old['username']}) → "
+                       f"{fname} {lname} ({username}), {role} @ {station}{note}", conn=conn)
+        return True, "User updated"
+    except sqlite3.IntegrityError:
+        return False, "Username already exists"
+    except sqlite3.Error as e:
+        return False, str(e)
+
+
+def set_user_active(user_id, active: bool, who):
+    me = st.session_state.get("_user_id")
+    if not active and user_id == me:
+        return False, "You cannot deactivate your own account"
+    with db() as conn:
+        u = conn.execute("SELECT fname, lname, username FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not u:
+            return False, "User not found"
+        conn.execute("UPDATE users SET is_active=?, updated_at=? WHERE id=?",
+                     (1 if active else 0, now_str(), user_id))
+        word = "activated" if active else "deactivated"
+        log_action(who, "ACTIVATE_USER" if active else "DEACTIVATE_USER", "USER", user_id,
+                   u["username"], f"User {word}: {u['fname']} {u['lname']} ({u['username']})", conn=conn)
+    return True, f"User {word}"
+
+
+def change_password(user_id, new_password, who):
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash=?, must_change_password=0, updated_at=? WHERE id=?",
+            (hash_password(new_password), now_str(), user_id),
+        )
+        log_action(who, "CHANGE_PASSWORD", "USER", user_id, who[0], "Changed own password", conn=conn)
+
+
+# -------------------- REPORTS --------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def get_reports(station=None, start_date=None, end_date=None, shift=None) -> pd.DataFrame:
+    query, params = "SELECT * FROM reports WHERE 1=1", []
+    if station and station != ALL_STATIONS:
+        query += " AND station = ?"
         params.append(station)
     if shift:
-        query += ' AND shift = ?'
+        query += " AND shift = ?"
         params.append(shift)
     if start_date:
-        query += ' AND report_date >= ?'
+        query += " AND report_date >= ?"
         params.append(start_date)
     if end_date:
-        query += ' AND report_date <= ?'
+        query += " AND report_date <= ?"
         params.append(end_date)
-    query += ' ORDER BY report_date DESC, shift ASC'
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
+    query += " ORDER BY report_date DESC, station, shift"
+    with db() as conn:
+        return pd.read_sql_query(query, conn, params=params)
 
-def get_station_stats(station=None, start_date=None, end_date=None):
-    conn = sqlite3.connect(DB_FILE)
-    params = []
-    where = "WHERE 1=1"
-    if station:
-        where += " AND station = ?"
-        params.append(station)
-    if start_date:
-        where += " AND report_date >= ?"
-        params.append(start_date)
-    if end_date:
-        where += " AND report_date <= ?"
-        params.append(end_date)
-    
-    query = f'''
-        SELECT 
-            COUNT(*) as total_reports,
-            COALESCE(SUM(exit_sys), 0) + COALESCE(SUM(entry_sys), 0) + COALESCE(SUM(exit_etc), 0) + COALESCE(SUM(entry_etc), 0) as total_traffic,
-            COALESCE(SUM(cash_sys), 0) + COALESCE(SUM(cash_man), 0) + COALESCE(SUM(etc), 0) as total_revenue,
-            COALESCE(SUM(gen_fuel), 0) + COALESCE(SUM(veh_fuel), 0) as total_fuel
-        FROM reports {where}
-    '''
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
 
-# -------------------- UNPAID VEHICLE FUNCTIONS --------------------
-def add_unpaid_vehicle(vehicle_number, vehicle_type, station, report_date, shift, supervisor, amount, reason, image_data=None, role=""):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO unpaid_vehicles (vehicle_number, vehicle_type, station, report_date, shift, supervisor, amount, reason, status, image_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (vehicle_number, vehicle_type, station, report_date, shift, supervisor, amount, reason, 'unpaid', image_data))
-    vehicle_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    log_action(supervisor, role, "CREATE_UNPAID", "UNPAID_VEHICLE", vehicle_id, vehicle_number,
-               f"Added unpaid vehicle {vehicle_number} ({vehicle_type}) - Br {amount}", station)
-    return True
+def get_report(station, report_date, shift):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM reports WHERE station=? AND report_date=? AND shift=?",
+            (station, report_date, shift),
+        ).fetchone()
+    return dict(row) if row else None
 
-def get_unpaid_vehicles(station=None, start_date=None, end_date=None, status=None):
-    conn = sqlite3.connect(DB_FILE)
-    query = 'SELECT * FROM unpaid_vehicles WHERE 1=1'
-    params = []
-    if station:
-        query += ' AND station = ?'
-        params.append(station)
-    if status and status != "All":
-        query += ' AND status = ?'
-        params.append(status)
-    if start_date:
-        query += ' AND report_date >= ?'
-        params.append(start_date)
-    if end_date:
-        query += ' AND report_date <= ?'
-        params.append(end_date)
-    query += ' ORDER BY report_date DESC, created_at DESC'
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
 
-def update_unpaid_vehicle_status(vehicle_id, status, paid_date=None, username="", role=""):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM unpaid_vehicles WHERE id = ?', (vehicle_id,))
-    row = cursor.fetchone()
-    
-    if status == 'paid' and paid_date:
-        cursor.execute('UPDATE unpaid_vehicles SET status = ?, paid_date = ? WHERE id = ?', (status, paid_date, vehicle_id))
-    else:
-        cursor.execute('UPDATE unpaid_vehicles SET status = ? WHERE id = ?', (status, vehicle_id))
-    conn.commit()
-    conn.close()
-    
-    if row and username:
-        log_action(username, role, "UPDATE_UNPAID_STATUS", "UNPAID_VEHICLE", vehicle_id, row[0],
-                   f"Marked {row[0]} as {status}")
-    return True
-
-def delete_unpaid_vehicle(vehicle_id, username="", role=""):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM unpaid_vehicles WHERE id = ?', (vehicle_id,))
-    row = cursor.fetchone()
-    
-    cursor.execute('DELETE FROM unpaid_vehicles WHERE id = ?', (vehicle_id,))
-    conn.commit()
-    conn.close()
-    
-    if row and username:
-        log_action(username, role, "DELETE_UNPAID", "UNPAID_VEHICLE", vehicle_id, row[0],
-                   f"Deleted unpaid vehicle {row[0]}")
-    return True
-
-# -------------------- IMAGE FUNCTIONS --------------------
-def process_image(uploaded_file):
-    """Process uploaded image: convert to RGB, resize, encode to base64"""
+def save_partial(station, report_date, shift, supervisor, fields: dict, label: str, who) -> str:
+    """Save only the given fields of a shift report (creates the report row if needed)."""
+    allowed = set(NUM_FIELDS + TEXT_FIELDS)
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return "error"
     try:
-        image = Image.open(uploaded_file)
-        
-        if image.mode in ("RGBA", "LA", "P"):
-            if image.mode == "P":
-                image = image.convert("RGBA")
-            rgb_image = Image.new("RGB", image.size, (255, 255, 255))
-            if image.mode == "RGBA":
-                rgb_image.paste(image, mask=image.split()[3])
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT id, is_settled FROM reports WHERE station=? AND report_date=? AND shift=?",
+                (station, report_date, shift),
+            ).fetchone()
+            target = f"{station} {report_date} Shift {shift}"
+            if existing:
+                if existing["is_settled"] == 1:
+                    return "settled"
+                cols = ["timestamp", "supervisor"] + list(fields)
+                sets = ", ".join(f"{c} = ?" for c in cols)
+                conn.execute(f"UPDATE reports SET {sets} WHERE id = ?",
+                             [now_str(), supervisor] + list(fields.values()) + [existing["id"]])
+                log_action(who, "UPDATE_REPORT", "REPORT", existing["id"], target,
+                           f"Saved {label}", station, conn=conn)
+                result = "updated"
             else:
-                rgb_image.paste(image)
-            image = rgb_image
-        elif image.mode != "RGB":
-            image = image.convert("RGB")
-        
-        image.thumbnail((800, 800))
-        buffered = io.BytesIO()
-        image.save(buffered, format="JPEG", quality=70)
-        image_data = base64.b64encode(buffered.getvalue()).decode()
-        
-        return image_data, image
-    except Exception as e:
-        return None, str(e)
+                cols = ["report_date", "shift", "timestamp", "supervisor", "station"] + list(fields)
+                marks = ", ".join("?" for _ in cols)
+                cur = conn.execute(
+                    f"INSERT INTO reports ({', '.join(cols)}) VALUES ({marks})",
+                    [report_date, shift, now_str(), supervisor, station] + list(fields.values()),
+                )
+                log_action(who, "CREATE_REPORT", "REPORT", cur.lastrowid, target,
+                           f"Created report with {label}", station, conn=conn)
+                result = "inserted"
+        st.cache_data.clear()
+        return result
+    except sqlite3.Error:
+        return "error"
 
-def display_vehicle_image(img):
-    """Display vehicle image from base64 string"""
-    if img is None:
-        st.info("📷 No image")
-        return
-    
-    try:
-        if pd.isna(img):
-            st.info("📷 No image")
-            return
-    except:
-        pass
-    
-    if isinstance(img, bytes):
-        try:
-            st.image(img, use_container_width=True)
-            return
-        except:
-            st.info("📷 No image")
-            return
-    
-    if isinstance(img, str):
-        if len(img.strip()) < 100:
-            st.info("📷 No image")
-            return
-        try:
-            if img.startswith("data:image"):
-                img = img.split(",", 1)[1]
-            img_bytes = base64.b64decode(img)
-            st.image(img_bytes, use_container_width=True)
-            return
-        except:
-            st.info("📷 No image")
-            return
-    
-    st.info("📷 No image")
 
-# -------------------- INIT --------------------
-init_database()
-migrate_database()
-create_admin_user()
-
-# -------------------- SESSION --------------------
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.username = ""
-    st.session_state.fname = ""
-    st.session_state.lname = ""
-    st.session_state.station = ""
-    st.session_state.role = ""
-    st.session_state.page = "Dashboard"
-
-# -------------------- LOGIN --------------------
-def login():
-    st.markdown("""
-    <div class="main-header">
-        <h1 style="font-size: 2.5rem; margin: 0;">🚦 Toll Operations</h1>
-        <p style="font-size: 1rem; margin: 0.2rem 0 0 0;">Shift Report System</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("""
-        <div style="background: white; padding: 2rem; border-radius: 15px; box-shadow: 0 5px 20px rgba(0,0,0,0.1);">
-            <h2 style="text-align: center; color: #333;">🔐 Login</h2>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        username = st.text_input("Username", key="login_username", placeholder="Enter username")
-        password = st.text_input("Password", type="password", key="login_password", placeholder="Enter password")
-        
-        if st.button("Login", use_container_width=True):
-            user = get_user(username)
-            if user:
-                # Check if user is active
-                if not user.get("is_active", 1):
-                    st.error("🚫 Your account is deactivated. Contact administrator.")
-                    log_action(username, user.get("role", ""), "LOGIN_FAILED", "USER", user.get("id"), username,
-                               "Login attempt on deactivated account")
-                    return
-                
-                if user["password_hash"] == hash_password(password):
-                    st.session_state.logged_in = True
-                    st.session_state.username = username
-                    st.session_state.fname = user.get("fname", "")
-                    st.session_state.lname = user.get("lname", "")
-                    st.session_state.station = user["station"]
-                    st.session_state.role = user["role"]
-                    
-                    log_action(username, user["role"], "LOGIN", "USER", user.get("id"), username,
-                               f"Logged in from {user['station']}")
-                    st.rerun()
-                else:
-                    log_action(username, user.get("role", ""), "LOGIN_FAILED", "USER", user.get("id"), username,
-                               "Wrong password")
-                    st.error("Invalid username or password")
-            else:
-                st.error("Invalid username or password")
-
-# -------------------- SIDEBAR --------------------
-def sidebar():
-    with st.sidebar:
-        is_manager = st.session_state.role == "manager"
-        
-        display_name = f"{st.session_state.fname} {st.session_state.lname}".strip()
-        if not display_name:
-            display_name = st.session_state.username
-        
-        st.markdown(f"""
-        <div style="text-align: center; padding: 0.5rem 0;">
-            <h3 style="color: white; margin: 0;">🚦 Toll Ops</h3>
-            <p style="color: #fff; font-size: 0.85rem; margin: 0.2rem 0; font-weight: bold;">{display_name}</p>
-            <p style="color: #aaa; font-size: 0.75rem; margin: 0.1rem 0;">@{st.session_state.username}</p>
-            <p style="color: #aaa; font-size: 0.8rem;">📍 {st.session_state.station}</p>
-            <p><span class="badge {'badge-manager' if is_manager else 'badge-supervisor'}">
-                {'👑 Manager' if is_manager else '🛡️ Supervisor'}
-            </span></p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        if is_manager:
-            if st.button("📊 Dashboard", use_container_width=True):
-                st.session_state.page = "Dashboard"
-                st.rerun()
-            if st.button("📈 Reports", use_container_width=True):
-                st.session_state.page = "Reports"
-                st.rerun()
-            if st.button("🔒 Settle Shifts", use_container_width=True):
-                st.session_state.page = "Settle"
-                st.rerun()
-            if st.button("📊 Analytics", use_container_width=True):
-                st.session_state.page = "Analytics"
-                st.rerun()
-            if st.button("📋 Consolidated", use_container_width=True):
-                st.session_state.page = "Consolidated"
-                st.rerun()
-            if st.button("🚫 Unpaid", use_container_width=True):
-                st.session_state.page = "Unpaid"
-                st.rerun()
-            if st.button("👥 Users", use_container_width=True):
-                st.session_state.page = "Users"
-                st.rerun()
-            if st.button("📋 Audit Log", use_container_width=True):
-                st.session_state.page = "AuditLog"
-                st.rerun()
-        else:
-            if st.button("📊 Dashboard", use_container_width=True):
-                st.session_state.page = "Dashboard"
-                st.rerun()
-            if st.button("📝 Submit Report", use_container_width=True):
-                st.session_state.page = "Submit"
-                st.rerun()
-            if st.button("📋 My Data", use_container_width=True):
-                st.session_state.page = "MyData"
-                st.rerun()
-            if st.button("🚫 Unpaid Vehicle", use_container_width=True):
-                st.session_state.page = "UserUnpaid"
-                st.rerun()
-        
-        st.markdown("---")
-        
-        old = st.text_input("Current Password", type="password", key="old_pass")
-        new = st.text_input("New Password", type="password", key="new_pass")
-        confirm = st.text_input("Confirm", type="password", key="confirm_pass")
-        
-        if st.button("Change Password", use_container_width=True):
-            user = get_user(st.session_state.username)
-            if user and user["password_hash"] == hash_password(old):
-                if new != confirm:
-                    st.error("Passwords don't match")
-                elif len(new) < 4:
-                    st.error("Min 4 characters")
-                else:
-                    update_password(st.session_state.username, new)
-                    log_action(st.session_state.username, st.session_state.role, "CHANGE_PASSWORD",
-                               "USER", user.get("id"), st.session_state.username, "Changed own password")
-                    st.success("✅ Password updated!")
-            else:
-                st.error("Current password incorrect")
-        
-        st.markdown("---")
-        if st.button("🚪 Logout", use_container_width=True):
-            log_action(st.session_state.username, st.session_state.role, "LOGOUT", "USER",
-                       None, st.session_state.username, "Logged out")
-            st.session_state.logged_in = False
-            st.session_state.username = ""
-            st.session_state.fname = ""
-            st.session_state.lname = ""
-            st.session_state.station = ""
-            st.session_state.role = ""
-            st.rerun()
-
-# ===================================================================
-# USER VIEWS
-# ===================================================================
-
-def user_dashboard():
-    st.markdown("""
-    <div class="main-header">
-        <h1 style="font-size: 2rem; margin: 0;">📊 My Dashboard</h1>
-        <p style="margin: 0.2rem 0 0 0;">Welcome, {}</p>
-    </div>
-    """.format(st.session_state.fname or st.session_state.username), unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=7))
-    with col2:
-        end_date = st.date_input("End Date", value=date.today())
-    
-    df = get_reports(
-        station=st.session_state.station,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    stats = get_station_stats(
-        station=st.session_state.station,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if not stats.empty:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(f"""
-            <div class="metric-card">
-                <h3 style="margin: 0; color: #667eea;">{int(stats['total_reports'].iloc[0])}</h3>
-                <p style="margin: 0; color: #666;">Reports</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #f093fb;">
-                <h3 style="margin: 0; color: #f093fb;">{int(stats['total_traffic'].iloc[0]):,}</h3>
-                <p style="margin: 0; color: #666;">Traffic</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col3:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #4CAF50;">
-                <h3 style="margin: 0; color: #4CAF50;">Br {stats['total_revenue'].iloc[0]:,.2f}</h3>
-                <p style="margin: 0; color: #666;">Revenue</p>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    if not df.empty:
-        st.subheader("📋 My Data")
-        display_cols = ["report_date", "shift", "exit_sys", "entry_sys", "exit_etc", "entry_etc", "cash_sys", "etc", "is_settled"]
-        available_cols = [c for c in display_cols if c in df.columns]
-        df_display = df[available_cols].copy()
-        
-        if 'is_settled' in df_display.columns:
-            df_display['is_settled'] = df_display['is_settled'].apply(lambda x: '🔒 Locked' if x == 1 else '✏️ Editable')
-        
-        st.dataframe(df_display, use_container_width=True)
-        st.download_button("📥 Download", df.to_csv(index=False), "my_data.csv")
-    else:
-        st.info("No data found")
-
-def user_submit():
-    st.markdown("""
-    <div class="main-header">
-        <h1 style="font-size: 2rem; margin: 0;">📝 Submit Report</h1>
-        <p style="margin: 0.2rem 0 0 0;">Station: {}</p>
-    </div>
-    """.format(st.session_state.station), unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        report_date = st.date_input("Date", value=date.today(), key="check_date")
-    with col2:
-        shift = st.selectbox("Shift", ["A", "B", "C"], key="check_shift")
-    
-    exists, is_settled = get_report_status(
-        report_date.strftime("%Y-%m-%d"), shift, st.session_state.station
-    )
-    
-    if exists and is_settled:
-        st.markdown("""
-        <div class="settled-box">
-            <h3>🔒 Shift Settled & Locked</h3>
-            <p>This shift has been settled by the admin.</p>
-            <p>You <strong>cannot edit</strong> this report.</p>
-            <p>Please contact your administrator if changes are needed.</p>
-        </div>
-        """, unsafe_allow_html=True)
-        return
-    
-    if exists:
-        st.warning("⚠️ A report already exists for this date/shift. You can **update** it until it's settled by admin.")
-    else:
-        st.success("✅ No report exists yet. You can submit a new report.")
-    
-    with st.form("report_form"):
-        st.markdown("### Traffic")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Exit**")
-            exit_sys = st.number_input("System", min_value=0, step=1, value=None, placeholder="Enter value", key="f_exit_sys")
-            exit_etc = st.number_input("ETC", min_value=0, step=1, value=None, placeholder="Enter value", key="f_exit_etc")
-            exit_man = st.number_input("Manual", min_value=0, step=1, value=None, placeholder="Enter value", key="f_exit_man")
-        with col2:
-            st.markdown("**Entry**")
-            entry_sys = st.number_input("System", min_value=0, step=1, value=None, placeholder="Enter value", key="f_entry_sys")
-            entry_etc = st.number_input("ETC", min_value=0, step=1, value=None, placeholder="Enter value", key="f_entry_etc")
-            entry_man = st.number_input("Manual", min_value=0, step=1, value=None, placeholder="Enter value", key="f_entry_man")
-        
-        st.markdown("### Cash")
-        col1, col2 = st.columns(2)
-        with col1:
-            cash_sys = st.number_input("Cash System", min_value=0.0, step=0.01, value=None, placeholder="Enter amount", key="f_cash_sys")
-            cash_man = st.number_input("Cash Manual", min_value=0.0, step=0.01, value=None, placeholder="Enter amount", key="f_cash_man")
-        with col2:
-            etc = st.number_input("ETC Collection", min_value=0.0, step=0.01, value=None, placeholder="Enter amount", key="f_etc")
-        
-        st.markdown("### Other")
-        col1, col2 = st.columns(2)
-        with col1:
-            thermal_in = st.number_input("Thermal In", min_value=0, step=1, value=None, placeholder="Enter rolls", key="f_thermal_in")
-            gen_fuel = st.number_input("Generator Fuel", min_value=0.0, step=0.1, value=None, placeholder="Enter liters", key="f_gen_fuel")
-            no_card = st.number_input("No Card", min_value=0, step=1, value=None, placeholder="Enter count", key="f_no_card")
-            forged_count = st.number_input("Forged Count", min_value=0, step=1, value=None, placeholder="Enter count", key="f_forged_count")
-            forged_amt = st.number_input("Forged Amount", min_value=0.0, step=0.01, value=None, placeholder="Enter amount", key="f_forged_amt")
-        with col2:
-            thermal_out = st.number_input("Thermal Out", min_value=0, step=1, value=None, placeholder="Enter rolls", key="f_thermal_out")
-            veh_fuel = st.number_input("Vehicle Fuel", min_value=0.0, step=0.1, value=None, placeholder="Enter liters", key="f_veh_fuel")
-            overload_count = st.number_input("Overload Count", min_value=0, step=1, value=None, placeholder="Enter count", key="f_overload_count")
-            overload_amt = st.number_input("Overload Amount", min_value=0.0, step=0.01, value=None, placeholder="Enter amount", key="f_overload_amt")
-            gen_hour = st.number_input("Generator Hour", min_value=0.0, step=0.1, value=None, placeholder="Enter reading", key="f_gen_hour")
-        
-        st.markdown("### Notes")
-        good_notes = st.text_area("Good Things", height=60, key="f_good")
-        problems = st.text_area("Problems", height=60, key="f_problems")
-        solution = st.text_area("Solution", height=60, key="f_solution")
-        
-        submitted = st.form_submit_button("✅ Submit", use_container_width=True)
-        
-        if submitted:
-            record = {
-                "report_date": report_date.strftime("%Y-%m-%d"),
-                "shift": shift,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "supervisor": st.session_state.username,
-                "station": st.session_state.station,
-                "exit_sys": exit_sys if exit_sys is not None else 0,
-                "entry_sys": entry_sys if entry_sys is not None else 0,
-                "exit_man": exit_man if exit_man is not None else 0,
-                "entry_man": entry_man if entry_man is not None else 0,
-                "exit_etc": exit_etc if exit_etc is not None else 0,
-                "entry_etc": entry_etc if entry_etc is not None else 0,
-                "cash_sys": cash_sys if cash_sys is not None else 0,
-                "cash_man": cash_man if cash_man is not None else 0,
-                "etc": etc if etc is not None else 0,
-                "thermal_in": thermal_in if thermal_in is not None else 0,
-                "thermal_out": thermal_out if thermal_out is not None else 0,
-                "gen_fuel": gen_fuel if gen_fuel is not None else 0,
-                "veh_fuel": veh_fuel if veh_fuel is not None else 0,
-                "no_card": no_card if no_card is not None else 0,
-                "forged_count": forged_count if forged_count is not None else 0,
-                "forged_amt": forged_amt if forged_amt is not None else 0,
-                "overload_count": overload_count if overload_count is not None else 0,
-                "overload_amt": overload_amt if overload_amt is not None else 0,
-                "gen_hour": gen_hour if gen_hour is not None else 0,
-                "good_notes": good_notes,
-                "problems": problems,
-                "solution": solution
-            }
-            
-            result = save_report(record, st.session_state.username, st.session_state.role)
-            
-            if result == "inserted":
-                st.success("✅ Report submitted successfully!")
-                st.balloons()
-                st.rerun()
-            elif result == "updated":
-                st.success("✅ Report updated successfully!")
-                st.rerun()
-            elif result == "settled":
-                st.error("🔒 This shift has been settled by admin. You cannot edit it.")
-            else:
-                st.error("❌ Error submitting report")
-
-def user_mydata():
-    st.markdown("""
-    <div class="main-header">
-        <h1 style="font-size: 2rem; margin: 0;">📋 My Data</h1>
-        <p style="margin: 0.2rem 0 0 0;">All your reports</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="my_start")
-    with col2:
-        end_date = st.date_input("End Date", value=date.today(), key="my_end")
-    
-    df = get_reports(
-        station=st.session_state.station,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if not df.empty:
-        if 'is_settled' in df.columns:
-            df['Status'] = df['is_settled'].apply(lambda x: '🔒 Locked' if x == 1 else '✏️ Editable')
-        
-        st.dataframe(df, use_container_width=True)
-        st.download_button("📥 Download", df.to_csv(index=False), "my_data.csv")
-    else:
-        st.info("No data found")
-
-def user_unpaid():
-    st.markdown("""
-    <div class="main-header">
-        <h1 style="font-size: 2rem; margin: 0;">🚫 Unpaid Vehicles</h1>
-        <p style="margin: 0.2rem 0 0 0;">Station: {}</p>
-    </div>
-    """.format(st.session_state.station), unsafe_allow_html=True)
-    
-    tab1, tab2 = st.tabs(["📋 My Unpaid List", "➕ Add Unpaid Vehicle"])
-    
-    with tab1:
-        st.subheader("📋 Unpaid Vehicles")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="u_start")
-        with col2:
-            end_date = st.date_input("End Date", value=date.today(), key="u_end")
-        
-        status_filter = st.selectbox("Status", ["All", "unpaid", "paid"], key="u_status")
-        
-        df = get_unpaid_vehicles(
-            station=st.session_state.station,
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
-            status=status_filter
-        )
-        
-        if not df.empty:
-            total_unpaid = len(df[df["status"] == "unpaid"])
-            total_paid = len(df[df["status"] == "paid"])
-            total_amount = df["amount"].sum()
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Vehicles", len(df))
-            with col2:
-                st.metric("Unpaid", total_unpaid)
-            with col3:
-                st.metric("Total Amount", f"Br {total_amount:,.2f}")
-            
-            st.markdown("---")
-            
-            for idx, row in df.iterrows():
-                status_icon = "✅" if row['status'] == "paid" else "⏳"
-                
-                with st.expander(f"{status_icon} {row['vehicle_number']} ({row['vehicle_type']}) - {row['status'].upper()} - Br {row['amount']:,.2f}"):
-                    col1, col2 = st.columns([2, 1])
-                    with col1:
-                        st.write(f"**Vehicle Number:** {row['vehicle_number']}")
-                        st.write(f"**Vehicle Type:** {row['vehicle_type']}")
-                        st.write(f"**Date:** {row['report_date']}")
-                        st.write(f"**Shift:** {row['shift']}")
-                        st.write(f"**Amount:** Br {row['amount']:,.2f}")
-                        st.write(f"**Reason:** {row['reason'] if row['reason'] else 'N/A'}")
-                        st.write(f"**Status:** {row['status'].upper()}")
-                        if row.get('paid_date'):
-                            st.write(f"**Paid Date:** {row['paid_date']}")
-                    
-                    with col2:
-                        st.markdown("**Vehicle Image:**")
-                        try:
-                            img = row['image_data']
-                        except:
-                            img = None
-                        display_vehicle_image(img)
-            
-            st.download_button(
-                "📥 Download My Unpaid Vehicles",
-                df.to_csv(index=False),
-                f"unpaid_{st.session_state.station}.csv",
-                use_container_width=True
+def set_settled(report_ids, settled: bool, who) -> int:
+    """Settle / unsettle many reports in one transaction."""
+    ids = [int(i) for i in report_ids]
+    if not ids:
+        return 0
+    marks = ",".join("?" for _ in ids)
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT id, station, report_date, shift FROM reports WHERE id IN ({marks})", ids
+        ).fetchall()
+        if settled:
+            conn.execute(
+                f"UPDATE reports SET is_settled=1, settled_at=?, settled_by=? WHERE id IN ({marks})",
+                [now_str(), who[0]] + ids,
             )
         else:
-            st.info("No unpaid vehicles found for the selected filters.")
-    
-    with tab2:
-        st.subheader("➕ Add Unpaid Vehicle")
-        
-        with st.form("user_unpaid_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                vehicle_number = st.text_input("Vehicle Number", placeholder="e.g., AA-1234")
-                vehicle_type = st.selectbox("Vehicle Type", VEHICLE_TYPES)
-                st.info(f"📍 Station: {st.session_state.station}")
-            with col2:
-                report_date = st.date_input("Date", value=date.today())
-                shift = st.selectbox("Shift", ["A", "B", "C"])
-                amount = st.number_input("Amount (Birr)", min_value=0.0, step=1.0)
-            
-            reason = st.text_area("Reason for Unpaid", placeholder="e.g., No card, Insufficient balance, etc.")
-            
-            uploaded_file = st.file_uploader("📷 Upload Vehicle Image (Optional)", type=["jpg", "jpeg", "png"])
-            
-            image_data = None
-            pil_image = None
-            if uploaded_file is not None:
-                image_data, result = process_image(uploaded_file)
-                if image_data:
-                    pil_image = result
-                    st.image(pil_image, caption="Uploaded Image Preview", width=200)
-                    st.success("✅ Image ready to save!")
-                else:
-                    st.error(f"Error: {result}")
-            
-            if st.form_submit_button("➕ Add Unpaid Vehicle", use_container_width=True):
-                if vehicle_number:
-                    add_unpaid_vehicle(
-                        vehicle_number=vehicle_number,
-                        vehicle_type=vehicle_type,
-                        station=st.session_state.station,
-                        report_date=report_date.strftime("%Y-%m-%d"),
-                        shift=shift,
-                        supervisor=st.session_state.username,
-                        amount=amount,
-                        reason=reason,
-                        image_data=image_data,
-                        role=st.session_state.role
-                    )
-                    st.success(f"✅ Unpaid vehicle {vehicle_number} added successfully!")
-                    st.balloons()
-                    st.rerun()
-                else:
-                    st.error("❌ Vehicle Number is required!")
+            conn.execute(
+                f"UPDATE reports SET is_settled=0, settled_at=NULL, settled_by=NULL WHERE id IN ({marks})",
+                ids,
+            )
+        for r in rows:
+            log_action(who, "SETTLE_REPORT" if settled else "UNSETTLE_REPORT", "REPORT", r["id"],
+                       f"{r['station']} {r['report_date']} Shift {r['shift']}",
+                       "Settled shift" if settled else "Unsettled shift", r["station"], conn=conn)
+    st.cache_data.clear()
+    return len(rows)
 
-# ===================================================================
-# ADMIN VIEWS
-# ===================================================================
 
-def admin_settle():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">🔒 Settle Shifts</h1>
-        <p style="margin: 0.2rem 0 0 0;">Lock shifts so supervisors cannot edit them</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.info("ℹ️ Once a shift is settled, supervisors cannot edit it. You can unlock it if needed.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=7), key="settle_start")
-    with col2:
-        end_date = st.date_input("End Date", value=date.today(), key="settle_end")
-    
-    station = st.selectbox("Station", ["All"] + STATIONS, key="settle_station")
-    station_param = None if station == "All" else station
-    
-    df = get_reports(
-        station=station_param,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if df.empty:
-        st.info("No reports found for the selected filters")
-        return
-    
-    total = len(df)
-    settled = len(df[df["is_settled"] == 1]) if "is_settled" in df.columns else 0
-    unsettled = total - settled
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Reports", total)
-    with col2:
-        st.metric("🔒 Settled", settled)
-    with col3:
-        st.metric("✏️ Unsettled", unsettled)
-    
-    st.markdown("---")
-    
-    st.subheader("⚡ Bulk Actions")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🔒 Settle ALL Unsettled", use_container_width=True):
-            unsettled_df = df[df["is_settled"] == 0] if "is_settled" in df.columns else df
-            for _, row in unsettled_df.iterrows():
-                settle_report(row["id"], st.session_state.username, st.session_state.role)
-            st.success(f"✅ Settled {len(unsettled_df)} reports!")
-            st.rerun()
-    
-    with col2:
-        if st.button("🔓 Unsettle ALL", use_container_width=True):
-            settled_df = df[df["is_settled"] == 1] if "is_settled" in df.columns else pd.DataFrame()
-            for _, row in settled_df.iterrows():
-                unsettle_report(row["id"], st.session_state.username, st.session_state.role)
-            st.success(f"✅ Unsettled {len(settled_df)} reports!")
-            st.rerun()
-    
-    st.markdown("---")
-    
-    st.subheader("📋 Individual Reports")
-    
-    for _, row in df.iterrows():
-        is_settled = row.get("is_settled", 0) == 1
-        status_icon = "🔒" if is_settled else "✏️"
-        status_text = "Settled" if is_settled else "Editable"
-        
-        with st.expander(f"{status_icon} {row['station']} | {row['report_date']} | Shift {row['shift']} | {status_text}"):
-            col1, col2 = st.columns([3, 1])
-            
-            with col1:
-                st.write(f"**Supervisor:** {row['supervisor']}")
-                st.write(f"**Traffic:** {int(row['exit_sys'] + row['entry_sys'] + row['exit_etc'] + row['entry_etc'])}")
-                st.write(f"**Revenue:** Br {row['cash_sys'] + row['cash_man'] + row['etc']:,.2f}")
-                
-                if is_settled:
-                    st.write(f"**Settled At:** {row.get('settled_at', 'N/A')}")
-                    st.write(f"**Settled By:** {row.get('settled_by', 'N/A')}")
-            
-            with col2:
-                if is_settled:
-                    if st.button(f"🔓 Unsettle", key=f"unsettle_{row['id']}", use_container_width=True):
-                        unsettle_report(row['id'], st.session_state.username, st.session_state.role)
-                        st.success("✅ Unsettled!")
-                        st.rerun()
-                else:
-                    if st.button(f"🔒 Settle", key=f"settle_{row['id']}", use_container_width=True):
-                        settle_report(row['id'], st.session_state.username, st.session_state.role)
-                        st.success("✅ Settled!")
-                        st.rerun()
+# -------------------- UNPAID VEHICLES --------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def get_unpaid(station=None, start_date=None, end_date=None, status=None) -> pd.DataFrame:
+    """List query. Images are NOT loaded here (they are large) - see get_unpaid_image."""
+    query = """SELECT id, vehicle_number, vehicle_type, station, report_date, shift, supervisor,
+                      amount, reason, status, paid_date, created_at,
+                      (image_data IS NOT NULL AND image_data != '') AS has_image
+               FROM unpaid_vehicles WHERE 1=1"""
+    params = []
+    if station and station != ALL_STATIONS:
+        query += " AND station = ?"
+        params.append(station)
+    if status and status != "All":
+        query += " AND status = ?"
+        params.append(status)
+    if start_date:
+        query += " AND report_date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND report_date <= ?"
+        params.append(end_date)
+    query += " ORDER BY report_date DESC, created_at DESC"
+    with db() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    df["has_image"] = df["has_image"].astype(bool)
+    return df
 
-def admin_dashboard():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">📊 Admin Dashboard</h1>
-        <p style="margin: 0.2rem 0 0 0;">Welcome, {}</p>
-    </div>
-    """.format(st.session_state.fname or st.session_state.username), unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="adm_start")
-    with col2:
-        end_date = st.date_input("End Date", value=date.today(), key="adm_end")
-    
-    df = get_reports(
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    stats = get_station_stats(
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if not stats.empty:
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #f5576c;">
-                <h3 style="margin: 0; color: #f5576c;">{int(stats['total_reports'].sum())}</h3>
-                <p style="margin: 0; color: #666;">Reports</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #f093fb;">
-                <h3 style="margin: 0; color: #f093fb;">{int(stats['total_traffic'].sum()):,}</h3>
-                <p style="margin: 0; color: #666;">Traffic</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col3:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #4CAF50;">
-                <h3 style="margin: 0; color: #4CAF50;">Br {stats['total_revenue'].sum():,.2f}</h3>
-                <p style="margin: 0; color: #666;">Revenue</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col4:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #FF6B6B;">
-                <h3 style="margin: 0; color: #FF6B6B;">{stats['total_fuel'].sum():.1f} L</h3>
-                <p style="margin: 0; color: #666;">Fuel</p>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    if not df.empty:
-        if 'is_settled' in df.columns:
-            settled = len(df[df['is_settled'] == 1])
-            unsettled = len(df) - settled
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("🔒 Settled Shifts", settled)
-            with col2:
-                st.metric("✏️ Unsettled Shifts", unsettled)
-            
-            st.markdown("---")
-        
-        st.subheader("📋 Report Data")
-        st.dataframe(df, use_container_width=True)
-        st.download_button("📥 Download", df.to_csv(index=False), "admin_report.csv")
-    else:
-        st.info("No data found")
 
-def admin_reports():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">📈 Reports</h1>
-        <p style="margin: 0.2rem 0 0 0;">All station reports</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="rep_start")
-    with col2:
-        end_date = st.date_input("End Date", value=date.today(), key="rep_end")
-    
-    station = st.selectbox("Station", ["All"] + STATIONS)
-    shift = st.selectbox("Shift", ["All", "A", "B", "C"])
-    status = st.selectbox("Status", ["All", "Settled", "Editable"])
-    
-    station_param = None if station == "All" else station
-    shift_param = None if shift == "All" else shift
-    
-    df = get_reports(
-        station=station_param,
-        shift=shift_param,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if not df.empty and 'is_settled' in df.columns:
-        if status == "Settled":
-            df = df[df['is_settled'] == 1]
-        elif status == "Editable":
-            df = df[df['is_settled'] == 0]
-    
-    if not df.empty:
-        st.dataframe(df, use_container_width=True)
-        st.download_button("📥 Download", df.to_csv(index=False), "reports.csv")
-        
-        st.markdown("---")
-        st.subheader("⚠️ Problems & Solutions")
-        issues = df[df["problems"].notna() & (df["problems"] != "")]
-        if not issues.empty:
-            for _, row in issues.iterrows():
-                st.markdown(f"""
-                <div style="background: #fff3cd; padding: 0.8rem; border-radius: 8px; border-left: 4px solid #f44336; margin-bottom: 0.5rem;">
-                    <strong>🚨 {row['station']}</strong> | {row['report_date']} | {row['shift']}<br>
-                    <strong>Problem:</strong> {row['problems']}<br>
-                    <strong>Solution:</strong> {row['solution'] if row['solution'] else 'No solution recorded'}
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.success("✅ No problems reported")
-    else:
-        st.info("No data found")
+def get_unpaid_image(vehicle_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT image_data FROM unpaid_vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+    return row["image_data"] if row else None
 
-def admin_analytics():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">📊 Analytics</h1>
-        <p style="margin: 0.2rem 0 0 0;">Charts & graphs</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="ana_start")
-    with col2:
-        end_date = st.date_input("End Date", value=date.today(), key="ana_end")
-    
-    station = st.selectbox("Station", ["All"] + STATIONS, key="ana_station")
-    station_param = None if station == "All" else station
-    
-    df = get_reports(
-        station=station_param,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if df.empty:
-        st.info("No data available")
-        return
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Reports", len(df))
-    with col2:
-        st.metric("Vehicles", int(df["exit_sys"].sum() + df["entry_sys"].sum() + df["exit_etc"].sum() + df["entry_etc"].sum()))
-    with col3:
-        st.metric("Revenue", f"Br {df['cash_sys'].sum() + df['cash_man'].sum() + df['etc'].sum():,.0f}")
-    with col4:
-        st.metric("Fuel", f"{df['gen_fuel'].sum() + df['veh_fuel'].sum():.1f} L")
-    
-    st.markdown("---")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("🚗 Traffic by Station")
-        traffic = df.groupby("station").agg({
-            "exit_sys": "sum", "entry_sys": "sum",
-            "exit_etc": "sum", "entry_etc": "sum"
-        }).reset_index()
-        traffic["Total"] = traffic["exit_sys"] + traffic["entry_sys"] + traffic["exit_etc"] + traffic["entry_etc"]
-        fig = px.bar(traffic, x="station", y="Total", color="station", color_discrete_sequence=px.colors.qualitative.Set2)
-        fig.update_layout(showlegend=False, plot_bgcolor="rgba(0,0,0,0)", height=350)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🥧 Traffic Distribution")
-        total_sys = df["exit_sys"].sum() + df["entry_sys"].sum()
-        total_etc = df["exit_etc"].sum() + df["entry_etc"].sum()
-        total_man = df["exit_man"].sum() + df["entry_man"].sum()
-        if total_sys > 0 or total_etc > 0 or total_man > 0:
-            fig = px.pie(values=[total_sys, total_etc, total_man], names=["System", "ETC", "Manual"],
-                        color_discrete_sequence=["#667eea", "#4CAF50", "#FF9800"])
-            fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", height=350)
-            st.plotly_chart(fig, use_container_width=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("💰 Revenue by Station")
-        rev = df.groupby("station").agg({"cash_sys": "sum", "cash_man": "sum", "etc": "sum"}).reset_index()
-        rev["Total"] = rev["cash_sys"] + rev["cash_man"] + rev["etc"]
-        fig = px.bar(rev, x="station", y="Total", color="station", color_discrete_sequence=px.colors.qualitative.Set2)
-        fig.update_layout(showlegend=False, plot_bgcolor="rgba(0,0,0,0)", height=350)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🥧 Revenue Distribution")
-        total_cash = df["cash_sys"].sum() + df["cash_man"].sum()
-        total_etc = df["etc"].sum()
-        if total_cash > 0 or total_etc > 0:
-            fig = px.pie(values=[total_cash, total_etc], names=["Cash", "ETC"],
-                        color_discrete_sequence=["#667eea", "#f093fb"])
-            fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", height=350)
-            st.plotly_chart(fig, use_container_width=True)
-    
-    st.subheader("📈 Daily Trends")
-    daily = df.groupby("report_date").agg({
-        "exit_sys": "sum", "entry_sys": "sum",
-        "exit_etc": "sum", "entry_etc": "sum",
-        "cash_sys": "sum", "cash_man": "sum", "etc": "sum"
-    }).reset_index()
-    daily["Traffic"] = daily["exit_sys"] + daily["entry_sys"] + daily["exit_etc"] + daily["entry_etc"]
-    daily["Revenue"] = daily["cash_sys"] + daily["cash_man"] + daily["etc"]
-    
-    fig = px.line(daily, x="report_date", y=["Traffic", "Revenue"],
-                  color_discrete_sequence=["#667eea", "#f5576c"])
-    fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", height=350)
-    st.plotly_chart(fig, use_container_width=True)
 
-def admin_consolidated():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">📋 Consolidated Report</h1>
-        <p style="margin: 0.2rem 0 0 0;">Summary by station</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="cons_start")
-    with col2:
-        end_date = st.date_input("End Date", value=date.today(), key="cons_end")
-    
-    df = get_reports(
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d")
-    )
-    
-    if df.empty:
-        st.info("No data available")
-        return
-    
-    summary = df.groupby("station").agg({
-        "supervisor": "count",
-        "exit_sys": "sum",
-        "entry_sys": "sum",
-        "exit_etc": "sum",
-        "entry_etc": "sum",
-        "cash_sys": "sum",
-        "cash_man": "sum",
-        "etc": "sum",
-        "gen_fuel": "sum",
-        "veh_fuel": "sum",
-        "no_card": "sum"
-    }).reset_index()
-    
-    summary["Traffic"] = summary["exit_sys"] + summary["entry_sys"] + summary["exit_etc"] + summary["entry_etc"]
-    summary["Revenue"] = summary["cash_sys"] + summary["cash_man"] + summary["etc"]
-    summary["Fuel"] = summary["gen_fuel"] + summary["veh_fuel"]
-    
-    display = summary[["station", "supervisor", "Traffic", "Revenue", "Fuel", "no_card"]]
-    display.columns = ["Station", "Reports", "Traffic", "Revenue", "Fuel (L)", "No Card"]
-    
-    st.dataframe(display, use_container_width=True)
-    st.download_button("📥 Download", summary.to_csv(index=False), "consolidated.csv")
-
-def admin_unpaid():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">🚫 Unpaid Vehicles</h1>
-        <p style="margin: 0.2rem 0 0 0;">Manage unpaid vehicles</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    tab1, tab2 = st.tabs(["📋 List", "➕ Add"])
-    
-    with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("Start Date", value=date.today() - timedelta(days=30), key="unp_start")
-        with col2:
-            end_date = st.date_input("End Date", value=date.today(), key="unp_end")
-        
-        station = st.selectbox("Station", ["All"] + STATIONS, key="unp_station")
-        station_param = None if station == "All" else station
-        
-        df = get_unpaid_vehicles(
-            station=station_param,
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d")
+def add_unpaid(vehicle_number, vehicle_type, station, report_date, shift, amount, reason, image_data, who):
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT INTO unpaid_vehicles (vehicle_number, vehicle_type, station, report_date, shift,
+                                            supervisor, amount, reason, status, image_data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unpaid', ?)""",
+            (vehicle_number, vehicle_type, station, report_date, shift, who[0], amount, reason, image_data),
         )
-        
-        if not df.empty:
-            total_unpaid = len(df[df["status"] == "unpaid"])
-            total_paid = len(df[df["status"] == "paid"])
-            total_amount = df["amount"].sum()
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Vehicles", len(df))
-            with col2:
-                st.metric("Unpaid", total_unpaid)
-            with col3:
-                st.metric("Total Amount", f"Br {total_amount:,.2f}")
-            
-            st.markdown("---")
-            st.subheader("📋 Vehicle Records")
-            
-            for idx, row in df.iterrows():
-                status_icon = "✅" if row['status'] == "paid" else "⏳"
-                
-                with st.expander(f"{status_icon} {row['vehicle_number']} ({row['vehicle_type']}) | {row['station']} | Br {row['amount']:,.2f}"):
-                    col1, col2 = st.columns([2, 1])
-                    with col1:
-                        st.write(f"**Vehicle Number:** {row['vehicle_number']}")
-                        st.write(f"**Vehicle Type:** {row['vehicle_type']}")
-                        st.write(f"**Station:** {row['station']}")
-                        st.write(f"**Date:** {row['report_date']}")
-                        st.write(f"**Shift:** {row['shift']}")
+        log_action(who, "CREATE_UNPAID", "UNPAID_VEHICLE", cur.lastrowid, vehicle_number,
+                   f"Added unpaid vehicle {vehicle_number} ({vehicle_type}) - Br {amount:,.2f}",
+                   station, conn=conn)
+    st.cache_data.clear()
+
+
+def set_unpaid_status(vehicle_id, status, who):
+    with db() as conn:
+        row = conn.execute("SELECT vehicle_number, station FROM unpaid_vehicles WHERE id=?",
+                           (vehicle_id,)).fetchone()
+        if not row:
+            return
+        paid_date = date.today().isoformat() if status == "paid" else None
+        conn.execute("UPDATE unpaid_vehicles SET status=?, paid_date=? WHERE id=?",
+                     (status, paid_date, vehicle_id))
+        log_action(who, "UPDATE_UNPAID_STATUS", "UNPAID_VEHICLE", vehicle_id, row["vehicle_number"],
+                   f"Marked {row['vehicle_number']} as {status}", row["station"], conn=conn)
+    st.cache_data.clear()
+
+
+def delete_unpaid(vehicle_id, who):
+    with db() as conn:
+        row = conn.execute("SELECT vehicle_number, station FROM unpaid_vehicles WHERE id=?",
+                           (vehicle_id,)).fetchone()
+        if not row:
+            return
+        conn.execute("DELETE FROM unpaid_vehicles WHERE id=?", (vehicle_id,))
+        log_action(who, "DELETE_UNPAID", "UNPAID_VEHICLE", vehicle_id, row["vehicle_number"],
+                   f"Deleted unpaid vehicle {row['vehicle_number']}", row["station"], conn=conn)
+    st.cache_data.clear()
+
+
+# -------------------- IMAGES --------------------
+MAX_UPLOAD_MB = 8
+
+
+def process_image(uploaded_file):
+    """Returns (base64_jpeg, None) or (None, error_message)."""
+    if uploaded_file.size > MAX_UPLOAD_MB * 1024 * 1024:
+        return None, f"Image is larger than {MAX_UPLOAD_MB} MB"
+    try:
+        image = Image.open(uploaded_file)
+        if image.mode in ("RGBA", "LA", "P"):
+            image = image.convert("RGBA")
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[3])
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        image.thumbnail((800, 800))
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=70)
+        return base64.b64encode(buf.getvalue()).decode(), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"Could not read image: {e}"
+
+
+def show_vehicle_image(vehicle_id: int):
+    data = get_unpaid_image(vehicle_id)
+    if not data or len(data.strip()) < 100:
+        st.caption("📷 No image")
+        return
+    try:
+        if data.startswith("data:image"):
+            data = data.split(",", 1)[1]
+        st.image(base64.b64decode(data), use_container_width=True)
+    except Exception:  # noqa: BLE001
+        st.caption("📷 Image could not be displayed")
+
+
+# ===================================================================
+# UI HELPERS
+# ===================================================================
+def flash(message: str, icon: str = "✅"):
+    """Queue a toast that survives st.rerun()."""
+    st.session_state.setdefault("_flash", []).append((message, icon))
+
+
+def show_flash():
+    for message, icon in st.session_state.pop("_flash", []):
+        st.toast(message, icon=icon)
+
+
+def current_user():
+    """Fresh user row from the DB on every run, so deactivation/role changes apply immediately."""
+    uid = st.session_state.get("_user_id")
+    if uid is None:
+        return None
+    user = get_user(user_id=uid)
+    if not user or not user["is_active"]:
+        for k in ("_user_id", "_user"):
+            st.session_state.pop(k, None)
+        return None
+    st.session_state["_user"] = user
+    return user
+
+
+def display_name(user) -> str:
+    return f"{user['fname']} {user['lname']}".strip() or user["username"]
+
+
+def date_range(key: str, days: int = 30, label: str = "Date range"):
+    today = date.today()
+    rng = st.date_input(label, value=(today - timedelta(days=days), today), key=key)
+    if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+        st.info("Pick both a start date and an end date.")
+        st.stop()
+    return rng[0].isoformat(), rng[1].isoformat()
+
+
+def own_station(user):
+    """Station filter for the user (None = all)."""
+    return None if user["role"] == "manager" or user["station"] == ALL_STATIONS else user["station"]
+
+
+def with_totals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["Entry"] = df["entry_sys"] + df["entry_etc"] + df["entry_man"]
+    df["Exit"] = df["exit_sys"] + df["exit_etc"] + df["exit_man"]
+    df["tr_sys"] = df["entry_sys"] + df["exit_sys"]
+    df["tr_etc"] = df["entry_etc"] + df["exit_etc"]
+    df["tr_man"] = df["entry_man"] + df["exit_man"]
+    df["Traffic"] = df[TRAFFIC_COLS].sum(axis=1)
+    df["Revenue"] = df[REVENUE_COLS].sum(axis=1)
+    df["Fuel"] = df[FUEL_COLS].sum(axis=1)
+    df["Status"] = df["is_settled"].map({1: "🔒 Settled", 0: "✏️ Open"})
+    return df
+
+
+def kpi_row(df: pd.DataFrame):
+    d = with_totals(df) if not df.empty else df
+    values = [
+        ("Reports", f"{len(df):,}"),
+        ("Traffic", f"{int(d['Traffic'].sum()):,}" if not df.empty else "0"),
+        ("Revenue", f"Br {d['Revenue'].sum():,.2f}" if not df.empty else "Br 0.00"),
+        ("Fuel", f"{d['Fuel'].sum():,.1f} L" if not df.empty else "0.0 L"),
+    ]
+    for col, (label, value) in zip(st.columns(4), values):
+        with col, st.container(border=True):
+            st.metric(label, value)
+
+
+REPORT_CONFIG = {
+    "report_date": st.column_config.TextColumn("Date"),
+    "shift": st.column_config.TextColumn("Shift", width="small"),
+    "station": st.column_config.TextColumn("Station"),
+    "supervisor": st.column_config.TextColumn("Supervisor"),
+    "Entry": st.column_config.NumberColumn("Entry", format="%d"),
+    "Exit": st.column_config.NumberColumn("Exit", format="%d"),
+    "Traffic": st.column_config.NumberColumn("Total Traffic", format="%d"),
+    "tr_sys": st.column_config.NumberColumn("Traffic System", format="%d"),
+    "tr_etc": st.column_config.NumberColumn("Traffic ETC", format="%d"),
+    "tr_man": st.column_config.NumberColumn("Traffic Manual", format="%d"),
+    "cash_sys": st.column_config.NumberColumn("Cash System", format="%.2f"),
+    "etc": st.column_config.NumberColumn("Cash ETC", format="%.2f"),
+    "cash_man": st.column_config.NumberColumn("Cash Manual", format="%.2f"),
+    "Revenue": st.column_config.NumberColumn("Total Revenue (Br)", format="%.2f"),
+    "gen_fuel": st.column_config.NumberColumn("Generator Fuel (L)", format="%.1f"),
+    "gen_hour": st.column_config.NumberColumn("Generator Hours", format="%.1f"),
+    "gen_operator": st.column_config.TextColumn("Generator Operator"),
+    "gen_remark": st.column_config.TextColumn("Generator Remark"),
+    "veh_fuel": st.column_config.NumberColumn("Vehicle Fuel (L)", format="%.1f"),
+    "veh_odo": st.column_config.NumberColumn("Vehicle Odometer (km)", format="%.1f"),
+    "Status": st.column_config.TextColumn("Status"),
+}
+
+REPORT_COLS = [
+    "Entry", "Exit", "Traffic", "tr_sys", "tr_etc", "tr_man",
+    "cash_sys", "etc", "cash_man", "Revenue",
+    "gen_fuel", "gen_hour", "gen_operator", "gen_remark",
+    "veh_fuel", "veh_odo", "Status",
+]
+
+
+def report_table(df: pd.DataFrame, key: str, selectable: bool = False, show_station: bool = True):
+    """Formatted report table. Returns the selection event when selectable."""
+    d = with_totals(df)
+    cols = ["report_date", "shift"] + (["station"] if show_station else []) + ["supervisor"] + REPORT_COLS
+    kwargs = dict(hide_index=True, use_container_width=True, column_config=REPORT_CONFIG, key=key)
+    if selectable:
+        return st.dataframe(d[cols], on_select="rerun", selection_mode="multi-row", **kwargs)
+    st.dataframe(d[cols], **kwargs)
+    return None
+
+
+def problems_section(df: pd.DataFrame):
+    issues = df[df["problems"].fillna("").str.strip() != ""]
+    st.subheader("⚠️ Problems & solutions")
+    if issues.empty:
+        st.success("No problems reported in this range.")
+        return
+    for _, r in issues.iterrows():
+        with st.container(border=True):
+            st.markdown(f"**🚨 {r['station']}** · {r['report_date']} · Shift {r['shift']}")
+            st.write(f"**Problem:** {r['problems']}")
+            st.write(f"**Solution:** {r['solution'] or '_No solution recorded_'}")
+
+
+def confirm_password_rules(new: str, confirm: str):
+    if new != confirm:
+        return "Passwords don't match"
+    if len(new) < MIN_PASSWORD:
+        return f"Password must be at least {MIN_PASSWORD} characters"
+    return None
+
+
+# ===================================================================
+# LOGIN / ACCOUNT
+# ===================================================================
+def login_view():
+    _, mid, _ = st.columns([1, 1.4, 1])
+    with mid:
+        header("🚦 Toll Operations", "Shift report system")
+        with st.form("login_form"):
+            st.subheader("Sign in")
+            username = st.text_input("Username", placeholder="Enter username")
+            password = st.text_input("Password", type="password", placeholder="Enter password")
+            submitted = st.form_submit_button("Login", use_container_width=True, type="primary")
+
+        if not submitted:
+            return
+        username = username.strip()
+        if not username or not password:
+            st.error("Enter your username and password.")
+            return
+
+        if recent_failed_logins(username) >= MAX_FAILED_LOGINS:
+            st.error(f"Too many failed attempts. Try again in {LOCKOUT_MINUTES} minutes.")
+            return
+
+        user = get_user(username=username)
+        if user and verify_password(password, user["password_hash"]):
+            if not user["is_active"]:
+                st.error("🚫 Your account is deactivated. Contact the administrator.")
+                log_action((username, user["role"]), "LOGIN_FAILED", "USER", user["id"], username,
+                           "Login attempt on deactivated account")
+                return
+            with db() as conn:
+                # Upgrade legacy hash, and force a change if the default admin password is still in use.
+                if not user["password_hash"].startswith("pbkdf2$"):
+                    conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                                 (hash_password(password), user["id"]))
+                if password == "admin123":
+                    conn.execute("UPDATE users SET must_change_password=1 WHERE id=?", (user["id"],))
+            st.session_state["_user_id"] = user["id"]
+            log_action((username, user["role"]), "LOGIN", "USER", user["id"], username,
+                       f"Logged in from {user['station']}")
+            st.rerun()
+        else:
+            log_action((username, user["role"] if user else None), "LOGIN_FAILED", "USER",
+                       user["id"] if user else None, username,
+                       "Wrong password" if user else "Unknown username")
+            st.error("Invalid username or password")
+
+
+def force_password_view(user):
+    _, mid, _ = st.columns([1, 1.4, 1])
+    with mid:
+        header("🔐 Set a new password", f"Welcome, {display_name(user)}")
+        st.info("For security you must choose a new password before continuing.")
+        with st.form("force_pw"):
+            new = st.text_input("New password", type="password")
+            confirm = st.text_input("Confirm new password", type="password")
+            if st.form_submit_button("Save password", type="primary", use_container_width=True):
+                err = confirm_password_rules(new, confirm)
+                if err:
+                    st.error(err)
+                elif new == "admin123":
+                    st.error("Choose a different password.")
+                else:
+                    change_password(user["id"], new, (user["username"], user["role"]))
+                    flash("Password updated")
+                    st.rerun()
+        if st.button("Logout"):
+            logout(user)
+
+
+def logout(user):
+    log_action((user["username"], user["role"]), "LOGOUT", "USER", user["id"], user["username"], "Logged out")
+    for k in ("_user_id", "_user"):
+        st.session_state.pop(k, None)
+    st.rerun()
+
+
+def sidebar_footer(user):
+    with st.sidebar:
+        st.divider()
+        st.markdown(f"**{display_name(user)}**")
+        st.caption(f"@{user['username']} · 📍 {user['station']}")
+        st.caption("👑 Manager" if user["role"] == "manager" else "🛡️ Supervisor")
+
+        with st.expander("🔑 Change password"):
+            with st.form("change_pw", clear_on_submit=True):
+                old = st.text_input("Current password", type="password")
+                new = st.text_input("New password", type="password")
+                confirm = st.text_input("Confirm", type="password")
+                if st.form_submit_button("Update", use_container_width=True):
+                    if not verify_password(old, user["password_hash"]):
+                        st.error("Current password is incorrect")
+                    elif (err := confirm_password_rules(new, confirm)):
+                        st.error(err)
+                    else:
+                        change_password(user["id"], new, (user["username"], user["role"]))
+                        st.success("Password updated")
+        if st.button("🚪 Logout", use_container_width=True):
+            logout(user)
+
+
+# ===================================================================
+# SHARED PAGES
+# ===================================================================
+def dashboard_page():
+    user = current_user()
+    is_mgr = user["role"] == "manager"
+    header("📊 Dashboard", f"Welcome, {user['fname'] or user['username']}", manager=is_mgr)
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        start, end = date_range("dash_range", days=30 if is_mgr else 7)
+    station = own_station(user)
+    if is_mgr:
+        with c2:
+            pick = st.selectbox("Station", [ALL_STATIONS] + STATIONS, key="dash_station")
+            station = None if pick == ALL_STATIONS else pick
+
+    df = get_reports(station=station, start_date=start, end_date=end)
+    kpi_row(df)
+
+    if df.empty:
+        st.info("No reports in this date range.")
+        return
+
+    if is_mgr:
+        settled = int(df["is_settled"].sum())
+        st.progress(settled / len(df), text=f"🔒 {settled} of {len(df)} shifts settled · "
+                                            f"✏️ {len(df) - settled} still open")
+
+    d = with_totals(df)
+    daily = d.groupby("report_date")[["Traffic", "Revenue"]].sum().reset_index()
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(daily, x="report_date", y="Traffic", title="Daily traffic",
+                     color_discrete_sequence=["#667eea"])
+        fig.update_layout(height=320, margin=dict(t=50, b=10), xaxis_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.line(daily, x="report_date", y="Revenue", title="Daily revenue (Br)", markers=True,
+                      color_discrete_sequence=["#f5576c"])
+        fig.update_layout(height=320, margin=dict(t=50, b=10), xaxis_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📋 Reports")
+    report_table(df, key="dash_table", show_station=station is None)
+    st.download_button("📥 Download CSV", df.to_csv(index=False), "reports.csv", mime="text/csv")
+
+
+def unpaid_page():
+    user = current_user()
+    is_mgr = user["role"] == "manager"
+    header("🚫 Unpaid Vehicles",
+           "Manage unpaid vehicles" if is_mgr else f"Station: {user['station']}", manager=is_mgr)
+    list_tab, add_tab = st.tabs(["📋 List", "➕ Add vehicle"])
+
+    with list_tab:
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            start, end = date_range("unp_range", days=30)
+        with c2:
+            status = st.selectbox("Status", ["All", "unpaid", "paid"], key="unp_status")
+        station = own_station(user)
+        if is_mgr:
+            with c3:
+                pick = st.selectbox("Station", [ALL_STATIONS] + STATIONS, key="unp_station")
+                station = None if pick == ALL_STATIONS else pick
+
+        df = get_unpaid(station=station, start_date=start, end_date=end, status=status).reset_index(drop=True)
+        if df.empty:
+            st.info("No unpaid vehicles found for these filters.")
+        else:
+            outstanding = df.loc[df["status"] == "unpaid", "amount"]
+            m = st.columns(4)
+            m[0].metric("Vehicles", len(df))
+            m[1].metric("Still unpaid", len(outstanding))
+            m[2].metric("Outstanding", f"Br {outstanding.sum():,.2f}")
+            m[3].metric("Total amount", f"Br {df['amount'].sum():,.2f}")
+
+            view = df[["report_date", "shift", "station", "vehicle_number", "vehicle_type",
+                       "amount", "status", "has_image"]]
+            event = st.dataframe(
+                view, hide_index=True, use_container_width=True,
+                on_select="rerun", selection_mode="single-row", key="unp_table",
+                column_config={
+                    "report_date": "Date", "shift": st.column_config.TextColumn("Shift", width="small"),
+                    "station": "Station", "vehicle_number": "Vehicle",
+                    "vehicle_type": st.column_config.TextColumn("Type", width="small"),
+                    "amount": st.column_config.NumberColumn("Amount (Br)", format="%.2f"),
+                    "status": "Status", "has_image": st.column_config.CheckboxColumn("Photo", width="small"),
+                },
+            )
+            st.caption("Select a row to see details" + (" and take action." if is_mgr else "."))
+
+            rows = event.selection.rows
+            if rows:
+                row = df.iloc[rows[0]]
+                with st.container(border=True):
+                    left, right = st.columns([2, 1])
+                    with left:
+                        st.subheader(f"{row['vehicle_number']} ({row['vehicle_type']})")
+                        st.write(f"**Station:** {row['station']} · **Date:** {row['report_date']} · "
+                                 f"**Shift:** {row['shift']}")
                         st.write(f"**Supervisor:** {row['supervisor']}")
                         st.write(f"**Amount:** Br {row['amount']:,.2f}")
-                        st.write(f"**Reason:** {row['reason'] if row['reason'] else 'N/A'}")
-                        st.write(f"**Status:** {row['status'].upper()}")
-                        if row.get('paid_date'):
-                            st.write(f"**Paid Date:** {row['paid_date']}")
-                    
-                    with col2:
-                        st.markdown("**Vehicle Image:**")
-                        try:
-                            img = row['image_data']
-                        except:
-                            img = None
-                        display_vehicle_image(img)
-                    
-                    col3, col4 = st.columns(2)
-                    with col3:
-                        new_status = "paid" if row['status'] == "unpaid" else "unpaid"
-                        if st.button(f"Mark as {new_status.upper()}", key=f"status_{row['id']}"):
-                            update_unpaid_vehicle_status(
-                                row['id'], new_status,
-                                date.today().strftime("%Y-%m-%d") if new_status == "paid" else None,
-                                st.session_state.username, st.session_state.role
-                            )
-                            st.success(f"✅ Marked as {new_status}!")
-                            st.rerun()
-                    with col4:
-                        if st.button("🗑️ Delete", key=f"delete_{row['id']}"):
-                            delete_unpaid_vehicle(row['id'], st.session_state.username, st.session_state.role)
-                            st.success("✅ Deleted!")
-                            st.rerun()
-            
-            st.download_button("📥 Download", df.to_csv(index=False), "unpaid.csv")
-        else:
-            st.info("No unpaid vehicles found")
-    
-    with tab2:
-        with st.form("unpaid_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                vehicle_number = st.text_input("Vehicle Number")
-                vehicle_type = st.selectbox("Vehicle Type", VEHICLE_TYPES)
-                station = st.selectbox("Station", STATIONS)
-            with col2:
-                report_date = st.date_input("Date", value=date.today())
-                shift = st.selectbox("Shift", ["A", "B", "C"])
-                amount = st.number_input("Amount", min_value=0.0, step=1.0)
-            
-            reason = st.text_area("Reason")
-            uploaded_file = st.file_uploader("Image", type=["jpg", "png", "jpeg"])
-            
-            image_data = None
-            pil_image = None
-            if uploaded_file:
-                image_data, result = process_image(uploaded_file)
-                if image_data:
-                    pil_image = result
-                    st.image(pil_image, width=150)
-                    st.success("✅ Image ready!")
-                else:
-                    st.error(f"Error: {result}")
-            
-            if st.form_submit_button("Add", use_container_width=True):
-                if vehicle_number:
-                    add_unpaid_vehicle(
-                        vehicle_number, vehicle_type, station,
-                        report_date.strftime("%Y-%m-%d"), shift,
-                        st.session_state.username, amount, reason, image_data,
-                        role=st.session_state.role
-                    )
-                    st.success("✅ Added successfully!")
-                    st.rerun()
-                else:
-                    st.error("Vehicle number required")
-
-# -------------------- USER MANAGEMENT (ADMIN) --------------------
-def admin_users():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">👥 User Management</h1>
-        <p style="margin: 0.2rem 0 0 0;">Create, edit, activate/deactivate users</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    tab1, tab2, tab3 = st.tabs(["📋 All Users", "➕ Add User", "✏️ Edit User"])
-    
-    # -------- TAB 1: ALL USERS --------
-    with tab1:
-        df = get_all_users()
-        if not df.empty:
-            # Summary
-            total = len(df)
-            active = len(df[df["is_active"] == 1])
-            inactive = total - active
-            managers = len(df[df["role"] == "manager"])
-            supervisors = len(df[df["role"] == "supervisor"])
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Users", total)
-            with col2:
-                st.metric("🟢 Active", active)
-            with col3:
-                st.metric("🔴 Inactive", inactive)
-            with col4:
-                st.metric("👑 / 🛡️", f"{managers} / {supervisors}")
-            
-            st.markdown("---")
-            
-            # Display users with status toggle
-            for idx, row in df.iterrows():
-                is_active = row["is_active"] == 1
-                status_icon = "🟢" if is_active else "🔴"
-                status_text = "Active" if is_active else "Inactive"
-                
-                full_name = f"{row['fname']} {row['lname']}".strip() or row['username']
-                
-                with st.expander(f"{status_icon} {full_name} | @{row['username']} | {row['role'].title()} | {row['station']}"):
-                    col1, col2, col3 = st.columns([2, 2, 1])
-                    
-                    with col1:
-                        st.write(f"**First Name:** {row['fname']}")
-                        st.write(f"**Last Name:** {row['lname']}")
-                        st.write(f"**Username:** {row['username']}")
-                    
-                    with col2:
-                        st.write(f"**Station:** {row['station']}")
-                        st.write(f"**Role:** {row['role'].title()}")
-                        st.write(f"**Status:** {status_text}")
-                        st.write(f"**Created:** {row['created_at']}")
-                    
-                    with col3:
-                        st.write("**Actions:**")
-                        
-                        # Status toggle button
-                        if is_active:
-                            if st.button("🔴 Deactivate", key=f"deact_{row['id']}", use_container_width=True):
-                                success, msg = toggle_user_status(
-                                    row['id'], False,
-                                    st.session_state.username, st.session_state.role
-                                )
-                                if success:
-                                    st.success(f"✅ {msg}")
-                                    st.rerun()
-                                else:
-                                    st.error(f"❌ {msg}")
-                        else:
-                            if st.button("🟢 Activate", key=f"act_{row['id']}", use_container_width=True):
-                                success, msg = toggle_user_status(
-                                    row['id'], True,
-                                    st.session_state.username, st.session_state.role
-                                )
-                                if success:
-                                    st.success(f"✅ {msg}")
-                                    st.rerun()
-                                else:
-                                    st.error(f"❌ {msg}")
-            
-            st.markdown("---")
-            st.download_button("📥 Download Users List", df.to_csv(index=False), "users.csv")
-        else:
-            st.info("No users found")
-    
-    # -------- TAB 2: ADD USER --------
-    with tab2:
-        st.subheader("➕ Add New User")
-        st.info("ℹ️ First Name, Last Name and Username must all be different")
-        
-        with st.form("add_user_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                fname = st.text_input("First Name", placeholder="e.g., Abebe")
-                lname = st.text_input("Last Name", placeholder="e.g., Kebede")
-                username = st.text_input("Username", placeholder="e.g., abebe.k")
-            with col2:
-                password = st.text_input("Password", type="password", placeholder="Min 4 characters")
-                station = st.selectbox("Station", STATIONS)
-                role = st.selectbox("Role", ["supervisor", "manager"])
-            
-            if st.form_submit_button("➕ Create User", use_container_width=True):
-                # Validation
-                errors = []
-                
-                if not fname.strip():
-                    errors.append("First Name is required")
-                if not lname.strip():
-                    errors.append("Last Name is required")
-                if not username.strip():
-                    errors.append("Username is required")
-                if not password:
-                    errors.append("Password is required")
-                elif len(password) < 4:
-                    errors.append("Password must be at least 4 characters")
-                
-                # Check fname != lname
-                if fname.strip().lower() == lname.strip().lower():
-                    errors.append("First Name and Last Name must be different")
-                
-                # Check username != fname and username != lname
-                if username.strip().lower() == fname.strip().lower():
-                    errors.append("Username must be different from First Name")
-                if username.strip().lower() == lname.strip().lower():
-                    errors.append("Username must be different from Last Name")
-                
-                # Check username doesn't exist
-                if check_username_exists(username.strip()):
-                    errors.append(f"Username '{username}' already exists")
-                
-                if errors:
-                    for err in errors:
-                        st.error(f"❌ {err}")
-                else:
-                    success, result = create_user(
-                        fname.strip(), lname.strip(), username.strip(),
-                        password, station, role,
-                        st.session_state.username, st.session_state.role
-                    )
-                    if success:
-                        st.success(f"✅ User '{fname} {lname}' (@{username}) created successfully!")
-                        st.balloons()
-                    else:
-                        st.error(f"❌ {result}")
-    
-    # -------- TAB 3: EDIT USER --------
-    with tab3:
-        st.subheader("✏️ Edit User")
-        
-        df = get_all_users()
-        if df.empty:
-            st.info("No users to edit")
-        else:
-            # User selector
-            user_options = {}
-            for _, row in df.iterrows():
-                label = f"{row['fname']} {row['lname']} (@{row['username']})"
-                user_options[label] = row['id']
-            
-            selected_label = st.selectbox("Select User to Edit", list(user_options.keys()))
-            selected_id = user_options[selected_label]
-            
-            # Get user data
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT fname, lname, username, station, role 
-                FROM users WHERE id = ?
-            ''', (selected_id,))
-            user = cursor.fetchone()
-            conn.close()
-            
-            if user:
-                st.markdown("---")
-                
-                with st.form("edit_user_form"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        new_fname = st.text_input("First Name", value=user[0])
-                        new_lname = st.text_input("Last Name", value=user[1])
-                        new_username = st.text_input("Username", value=user[2])
-                    with col2:
-                        # Station options
-                        station_options = STATIONS + ["All Stations"]
-                        if user[3] in station_options:
-                            station_idx = station_options.index(user[3])
-                        else:
-                            station_idx = 0
-                        new_station = st.selectbox("Station", station_options, index=station_idx)
-                        
-                        # Role options
-                        role_options = ["supervisor", "manager"]
-                        role_idx = role_options.index(user[4]) if user[4] in role_options else 0
-                        new_role = st.selectbox("Role", role_options, index=role_idx)
-                    
-                    st.markdown("**Change Password (optional)**")
-                    new_password = st.text_input("New Password", type="password", 
-                                                  placeholder="Leave empty to keep current password")
-                    
-                    if st.form_submit_button("💾 Update User", use_container_width=True):
-                        errors = []
-                        
-                        if not new_fname.strip():
-                            errors.append("First Name is required")
-                        if not new_lname.strip():
-                            errors.append("Last Name is required")
-                        if not new_username.strip():
-                            errors.append("Username is required")
-                        
-                        # Check fname != lname
-                        if new_fname.strip().lower() == new_lname.strip().lower():
-                            errors.append("First Name and Last Name must be different")
-                        
-                        # Check username != fname and != lname
-                        if new_username.strip().lower() == new_fname.strip().lower():
-                            errors.append("Username must be different from First Name")
-                        if new_username.strip().lower() == new_lname.strip().lower():
-                            errors.append("Username must be different from Last Name")
-                        
-                        # Check username uniqueness (excluding current user)
-                        if check_username_exists(new_username.strip(), exclude_id=selected_id):
-                            errors.append(f"Username '{new_username}' already exists")
-                        
-                        # Password check if provided
-                        if new_password and len(new_password) < 4:
-                            errors.append("Password must be at least 4 characters")
-                        
-                        if errors:
-                            for err in errors:
-                                st.error(f"❌ {err}")
-                        else:
-                            success, msg = update_user(
-                                selected_id,
-                                new_fname.strip(), new_lname.strip(), new_username.strip(),
-                                new_station, new_role,
-                                new_password if new_password else None,
-                                st.session_state.username, st.session_state.role
-                            )
-                            if success:
-                                st.success(f"✅ {msg}")
-                                st.balloons()
+                        st.write(f"**Reason:** {row['reason'] or 'N/A'}")
+                        st.write(f"**Status:** {str(row['status']).upper()}"
+                                 + (f" (paid {row['paid_date']})" if row["paid_date"] else ""))
+                        if is_mgr:
+                            b1, b2 = st.columns(2)
+                            new_status = "paid" if row["status"] == "unpaid" else "unpaid"
+                            if b1.button(f"Mark as {new_status}", key=f"st_{row['id']}", type="primary",
+                                         use_container_width=True):
+                                set_unpaid_status(int(row["id"]), new_status, actor())
+                                flash(f"{row['vehicle_number']} marked {new_status}")
                                 st.rerun()
-                            else:
-                                st.error(f"❌ {msg}")
+                            if b2.button("🗑️ Delete", key=f"del_{row['id']}", use_container_width=True):
+                                confirm_delete_unpaid(int(row["id"]), row["vehicle_number"])
+                    with right:
+                        if row["has_image"]:
+                            show_vehicle_image(int(row["id"]))
+                        else:
+                            st.caption("📷 No image")
 
-# -------------------- AUDIT LOG (ADMIN) --------------------
-def admin_audit_log():
-    st.markdown("""
-    <div class="manager-header">
-        <h1 style="font-size: 2rem; margin: 0;">📋 System Audit Log</h1>
-        <p style="margin: 0.2rem 0 0 0;">All system activity</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Filters
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        filter_username = st.text_input("Filter by Username", placeholder="All users")
-    with col2:
-        action_options = ["All", "LOGIN", "LOGOUT", "LOGIN_FAILED", "CREATE_USER", "UPDATE_USER",
-                          "ACTIVATE_USER", "DEACTIVATE_USER", "CHANGE_PASSWORD",
-                          "CREATE_REPORT", "UPDATE_REPORT", "SETTLE_REPORT", "UNSETTLE_REPORT",
-                          "CREATE_UNPAID", "UPDATE_UNPAID_STATUS", "DELETE_UNPAID"]
-        filter_action = st.selectbox("Filter by Action", action_options)
-    with col3:
-        filter_start = st.date_input("Start Date", value=date.today() - timedelta(days=7), key="log_start")
-    with col4:
-        filter_end = st.date_input("End Date", value=date.today(), key="log_end")
-    
-    limit = st.slider("Show last N entries", min_value=50, max_value=1000, value=200, step=50)
-    
-    # Query
-    username_param = filter_username.strip() if filter_username.strip() else None
-    action_param = None if filter_action == "All" else filter_action
-    
-    df = get_audit_log(
-        limit=limit,
-        username=username_param,
-        action=action_param,
-        start_date=filter_start.strftime("%Y-%m-%d"),
-        end_date=filter_end.strftime("%Y-%m-%d")
-    )
-    
-    if df.empty:
-        st.info("No log entries found for the selected filters")
-        return
-    
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Entries", len(df))
-    with col2:
-        unique_users = df["username"].nunique()
-        st.metric("Unique Users", unique_users)
-    with col3:
-        unique_actions = df["action"].nunique()
-        st.metric("Action Types", unique_actions)
-    with col4:
-        if not df.empty:
-            latest = df.iloc[0]["timestamp"]
-            st.metric("Latest Activity", str(latest)[:10] if latest else "—")
-    
-    st.markdown("---")
-    
-    # Display log entries
-    st.subheader(f"📋 Log Entries ({len(df)})")
-    
-    for idx, row in df.iterrows():
-        action = row["action"]
-        
-        # Icon based on action
-        icon = "ℹ️"
-        css_class = ""
-        if "LOGIN_FAILED" in action:
-            icon = "⚠️"
-            css_class = "log-action-delete"
-        elif "LOGIN" in action:
-            icon = "🔑"
-            css_class = "log-action-login"
-        elif "LOGOUT" in action:
-            icon = "🚪"
-            css_class = "log-action-login"
-        elif "CREATE" in action:
-            icon = "➕"
-            css_class = "log-action-create"
-        elif "UPDATE" in action or "CHANGE" in action:
-            icon = "✏️"
-            css_class = "log-action-update"
-        elif "DELETE" in action or "DEACTIVATE" in action:
-            icon = "🗑️"
-            css_class = "log-action-delete"
-        elif "ACTIVATE" in action:
-            icon = "✅"
-            css_class = "log-action-create"
-        elif "SETTLE" in action and "UNSETTLE" not in action:
-            icon = "🔒"
-            css_class = "log-action-settle"
-        elif "UNSETTLE" in action:
-            icon = "🔓"
-            css_class = "log-action-settle"
-        
-        # Build details
-        details_parts = []
-        if row.get("target_name"):
-            details_parts.append(f"<strong>{row['target_name']}</strong>")
-        if row.get("details"):
-            details_parts.append(row["details"])
-        if row.get("station"):
-            details_parts.append(f"📍 {row['station']}")
-        
-        details_str = " — ".join(details_parts) if details_parts else ""
-        
-        st.markdown(f"""
-        <div class="log-entry {css_class}">
-            <strong>{icon} {action}</strong>
-            &nbsp;|&nbsp; 
-            <span style="color: #666;">{row['timestamp']}</span>
-            &nbsp;|&nbsp;
-            <strong>@{row['username']}</strong>
-            <span style="color: #999;">({row.get('role', '')})</span>
-            <br>
-            <span style="color: #555; font-size: 0.8rem;">{details_str}</span>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Download
-    st.download_button(
-        "📥 Download Audit Log (CSV)",
-        df.to_csv(index=False),
-        f"audit_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        use_container_width=True
-    )
+            st.download_button("📥 Download CSV", df.to_csv(index=False), "unpaid_vehicles.csv",
+                               mime="text/csv")
 
-# -------------------- MAIN --------------------
-def main():
-    if not st.session_state.logged_in:
-        login()
+    with add_tab:
+        with st.form("unpaid_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                number = st.text_input("Vehicle number", placeholder="e.g., AA-1234")
+                vtype = st.selectbox("Vehicle type", VEHICLE_TYPES)
+                if is_mgr or user["station"] == ALL_STATIONS:
+                    station_in = st.selectbox("Station", STATIONS)
+                else:
+                    station_in = user["station"]
+                    st.text_input("Station", value=station_in, disabled=True)
+            with c2:
+                rdate = st.date_input("Date", value=date.today(), max_value=date.today())
+                shift = st.selectbox("Shift", SHIFTS)
+                amount = st.number_input("Amount (Birr)", min_value=0.0, step=1.0)
+            reason = st.text_area("Reason", placeholder="e.g., No card, insufficient balance")
+            photo = st.file_uploader("📷 Vehicle photo (optional)", type=["jpg", "jpeg", "png"])
+
+            if st.form_submit_button("➕ Add unpaid vehicle", type="primary", use_container_width=True):
+                number = number.strip().upper()
+                if not number:
+                    st.error("Vehicle number is required.")
+                else:
+                    image_data, err = (None, None)
+                    if photo is not None:
+                        image_data, err = process_image(photo)
+                    if err:
+                        st.error(err)
+                    else:
+                        add_unpaid(number, vtype, station_in, rdate.isoformat(), shift, amount,
+                                   reason.strip(), image_data, actor())
+                        flash(f"Unpaid vehicle {number} added")
+                        st.rerun()
+
+
+@st.dialog("Delete unpaid vehicle")
+def confirm_delete_unpaid(vehicle_id: int, number: str):
+    st.warning(f"Permanently delete **{number}**? This cannot be undone.")
+    c1, c2 = st.columns(2)
+    if c1.button("Delete", type="primary", use_container_width=True):
+        delete_unpaid(vehicle_id, actor())
+        flash(f"{number} deleted", "🗑️")
+        st.rerun()
+    if c2.button("Cancel", use_container_width=True):
+        st.rerun()
+
+
+# ===================================================================
+# SUPERVISOR PAGES
+# ===================================================================
+def submit_page():
+    user = current_user()
+    header("📝 Submit Report", f"Station: {user['station']}")
+
+    if user["station"] == ALL_STATIONS:
+        station = st.selectbox("Station", STATIONS)
     else:
-        sidebar()
-        
-        is_manager = st.session_state.role == "manager"
-        
-        if is_manager:
-            if st.session_state.page == "Dashboard":
-                admin_dashboard()
-            elif st.session_state.page == "Reports":
-                admin_reports()
-            elif st.session_state.page == "Settle":
-                admin_settle()
-            elif st.session_state.page == "Analytics":
-                admin_analytics()
-            elif st.session_state.page == "Consolidated":
-                admin_consolidated()
-            elif st.session_state.page == "Unpaid":
-                admin_unpaid()
-            elif st.session_state.page == "Users":
-                admin_users()
-            elif st.session_state.page == "AuditLog":
-                admin_audit_log()
-            else:
-                admin_dashboard()
-        else:
-            if st.session_state.page == "Dashboard":
-                user_dashboard()
-            elif st.session_state.page == "Submit":
-                user_submit()
-            elif st.session_state.page == "MyData":
-                user_mydata()
-            elif st.session_state.page == "UserUnpaid":
-                user_unpaid()
-            else:
-                user_dashboard()
-        
-        st.markdown('<div class="footer">© 2026 Toll Operations Manager</div>', unsafe_allow_html=True)
+        station = user["station"]
 
-if __name__ == "__main__":
-    main()
+    c1, c2 = st.columns(2)
+    report_date = c1.date_input("Date", value=date.today(), max_value=date.today()).isoformat()
+    shift = c2.selectbox("Shift", SHIFTS)
+
+    existing = get_report(station, report_date, shift)
+
+    if existing and existing["is_settled"] == 1:
+        st.markdown(
+            "<div class='locked-box'><h3>🔒 Shift settled &amp; locked</h3>"
+            "<p>This shift was settled by the manager and can no longer be edited.<br>"
+            "Contact your manager if changes are needed.</p></div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    if existing:
+        st.warning(f"A report already exists for this date and shift (last saved {existing['timestamp']}). "
+                   "Each tab saves on its own and updates the report until the manager settles it.")
+    else:
+        st.success("No report yet for this date and shift — fill in any tab and press its Save button.")
+
+    prefix = f"rep_{station}_{report_date}_{shift}"  # fresh widget state per report
+
+    def num(label, field, ph):
+        val = existing[field] if existing and existing.get(field) is not None else None
+        if field in INT_FIELDS:
+            return st.number_input(label, min_value=0, step=1, value=int(val) if val is not None else None,
+                                   placeholder=ph, key=f"{prefix}_{field}")
+        step = 0.1 if field in ("gen_fuel", "veh_fuel", "veh_odo", "gen_hour") else 0.01
+        return st.number_input(label, min_value=0.0, step=step,
+                               value=float(val) if val is not None else None,
+                               placeholder=ph, key=f"{prefix}_{field}")
+
+    def line(label, field, ph=""):
+        return st.text_input(label, value=(existing or {}).get(field) or "", placeholder=ph,
+                             key=f"{prefix}_{field}")
+
+    def area(label, field):
+        return st.text_area(label, value=(existing or {}).get(field) or "", height=90,
+                            key=f"{prefix}_{field}")
+
+    def save_section(title: str, vals: dict):
+        clean = {f: ((v or "").strip() if f in TEXT_FIELDS else (v or 0)) for f, v in vals.items()}
+        if not existing and not any(clean.values()):
+            st.error("Enter at least one value before saving.")
+            return
+        result = save_partial(station, report_date, shift, user["username"], clean, title, actor())
+        if result in ("inserted", "updated"):
+            st.success(f"✅ {title} saved.")
+            st.toast(f"{title} saved", icon="✅")
+        elif result == "settled":
+            st.error("🔒 This shift was just settled by the manager. You cannot edit it.")
+        else:
+            st.error("❌ Could not save. Please try again.")
+
+    # Each tab is its own form with its own save button (no st.rerun, so the selected tab stays put).
+    tabs = st.tabs(["🚗 Traffic", "💰 Cash", "🧾 Thermal Paper", "⚡ Generator",
+                    "⛽ Vehicle Fuel", "📝 Notes"])
+
+    with tabs[0]:
+        with st.form(f"{prefix}_f_traffic"):
+            v = {}
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Exit**")
+                v["exit_sys"] = num("System", "exit_sys", "0")
+                v["exit_etc"] = num("ETC", "exit_etc", "0")
+                v["exit_man"] = num("Manual", "exit_man", "0")
+            with c2:
+                st.markdown("**Entry**")
+                v["entry_sys"] = num("System", "entry_sys", "0")
+                v["entry_etc"] = num("ETC", "entry_etc", "0")
+                v["entry_man"] = num("Manual", "entry_man", "0")
+            go = st.form_submit_button("💾 Save traffic", type="primary", use_container_width=True)
+        if go:
+            save_section("Traffic", v)
+
+    with tabs[1]:
+        with st.form(f"{prefix}_f_cash"):
+            v = {}
+            c1, c2 = st.columns(2)
+            with c1:
+                v["cash_sys"] = num("Cash — system", "cash_sys", "Amount")
+                v["cash_man"] = num("Cash — manual", "cash_man", "Amount")
+            with c2:
+                v["etc"] = num("ETC collection", "etc", "Amount")
+            go = st.form_submit_button("💾 Save cash", type="primary", use_container_width=True)
+        if go:
+            save_section("Cash", v)
+
+    with tabs[2]:
+        with st.form(f"{prefix}_f_thermal"):
+            v = {}
+            c1, c2 = st.columns(2)
+            with c1:
+                v["thermal_exit"] = num("Exit lanes — rolls", "thermal_exit", "Rolls")
+            with c2:
+                v["thermal_entry"] = num("Entry lanes — rolls", "thermal_entry", "Rolls")
+            go = st.form_submit_button("💾 Save thermal paper", type="primary", use_container_width=True)
+        if go:
+            save_section("Thermal paper", v)
+
+    with tabs[3]:
+        with st.form(f"{prefix}_f_gen"):
+            v = {}
+            c1, c2 = st.columns(2)
+            with c1:
+                v["gen_fuel"] = num("Fuel (litres)", "gen_fuel", "Litres")
+                v["gen_operator"] = line("Operator name (who gave the fuel)", "gen_operator", "Full name")
+            with c2:
+                v["gen_hour"] = num("Generator hour meter", "gen_hour", "Hours")
+                v["gen_remark"] = line("Remark", "gen_remark", "Optional")
+            go = st.form_submit_button("💾 Save generator", type="primary", use_container_width=True)
+        if go:
+            save_section("Generator", v)
+
+    with tabs[4]:
+        with st.form(f"{prefix}_f_veh"):
+            v = {}
+            c1, c2 = st.columns(2)
+            with c1:
+                v["veh_fuel"] = num("Fuel (litres)", "veh_fuel", "Litres")
+            with c2:
+                v["veh_odo"] = num("Odometer (km)", "veh_odo", "Reading")
+            go = st.form_submit_button("💾 Save vehicle fuel", type="primary", use_container_width=True)
+        if go:
+            save_section("Vehicle fuel", v)
+
+    with tabs[5]:
+        with st.form(f"{prefix}_f_notes"):
+            v = {
+                "good_notes": area("Good things", "good_notes"),
+                "problems": area("Problems", "problems"),
+                "solution": area("Solution", "solution"),
+            }
+            go = st.form_submit_button("💾 Save notes", type="primary", use_container_width=True)
+        if go:
+            save_section("Notes", v)
+
+
+def my_reports_page():
+    user = current_user()
+    header("📋 My Reports", f"All reports for {user['station']}")
+    start, end = date_range("my_range", days=30)
+    df = get_reports(station=own_station(user), start_date=start, end_date=end)
+    if df.empty:
+        st.info("No reports in this date range.")
+        return
+    report_table(df, key="my_table", show_station=own_station(user) is None)
+    st.download_button("📥 Download CSV", df.to_csv(index=False), "my_reports.csv", mime="text/csv")
+    st.divider()
+    problems_section(df)
+
+
+# ===================================================================
+# MANAGER PAGES
+# ===================================================================
+def reports_page():
+    header("📈 Reports", "All station reports", manager=True)
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        start, end = date_range("rep_range")
+    station = c2.selectbox("Station", [ALL_STATIONS] + STATIONS, key="rep_station")
+    shift = c3.selectbox("Shift", ["All"] + SHIFTS, key="rep_shift")
+    status = c4.selectbox("Status", ["All", "Settled", "Open"], key="rep_status")
+
+    df = get_reports(station=None if station == ALL_STATIONS else station,
+                     shift=None if shift == "All" else shift, start_date=start, end_date=end)
+    if status != "All":
+        df = df[df["is_settled"] == (1 if status == "Settled" else 0)]
+    if df.empty:
+        st.info("No reports found.")
+        return
+
+    report_table(df, key="rep_table")
+    st.download_button("📥 Download CSV (all columns)", df.to_csv(index=False), "reports.csv",
+                       mime="text/csv")
+    st.divider()
+    problems_section(df)
+
+
+def settle_page():
+    header("🔒 Settle Shifts", "Lock shifts so supervisors can no longer edit them", manager=True)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        start, end = date_range("settle_range", days=7)
+    station = c2.selectbox("Station", [ALL_STATIONS] + STATIONS, key="settle_station")
+
+    df = get_reports(station=None if station == ALL_STATIONS else station,
+                     start_date=start, end_date=end).reset_index(drop=True)
+    if df.empty:
+        st.info("No reports found for these filters.")
+        return
+
+    settled = int(df["is_settled"].sum())
+    m = st.columns(3)
+    m[0].metric("Total", len(df))
+    m[1].metric("🔒 Settled", settled)
+    m[2].metric("✏️ Open", len(df) - settled)
+
+    st.caption("Select one or more rows, then settle or unsettle them.")
+    event = report_table(df, key="settle_table", selectable=True)
+    picked = df.iloc[event.selection.rows] if event and event.selection.rows else df.iloc[0:0]
+
+    b1, b2, b3 = st.columns(3)
+    to_settle = picked[picked["is_settled"] == 0]
+    to_unsettle = picked[picked["is_settled"] == 1]
+    if b1.button(f"🔒 Settle selected ({len(to_settle)})", disabled=to_settle.empty,
+                 type="primary", use_container_width=True):
+        n = set_settled(to_settle["id"].tolist(), True, actor())
+        flash(f"Settled {n} report(s)", "🔒")
+        st.rerun()
+    if b2.button(f"🔓 Unsettle selected ({len(to_unsettle)})", disabled=to_unsettle.empty,
+                 use_container_width=True):
+        n = set_settled(to_unsettle["id"].tolist(), False, actor())
+        flash(f"Unsettled {n} report(s)", "🔓")
+        st.rerun()
+    open_ids = df.loc[df["is_settled"] == 0, "id"].tolist()
+    if b3.button(f"⚡ Settle all open ({len(open_ids)})", disabled=not open_ids, use_container_width=True):
+        confirm_settle_all(open_ids)
+
+
+@st.dialog("Settle all open shifts")
+def confirm_settle_all(ids):
+    st.warning(f"This will lock **{len(ids)}** shift report(s) in the current filter.")
+    c1, c2 = st.columns(2)
+    if c1.button("Settle all", type="primary", use_container_width=True):
+        n = set_settled(ids, True, actor())
+        flash(f"Settled {n} report(s)", "🔒")
+        st.rerun()
+    if c2.button("Cancel", use_container_width=True):
+        st.rerun()
+
+
+def analytics_page():
+    header("📊 Analytics", "Charts & comparisons", manager=True)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        start, end = date_range("ana_range")
+    station = c2.selectbox("Station", [ALL_STATIONS] + STATIONS, key="ana_station")
+    df = get_reports(station=None if station == ALL_STATIONS else station, start_date=start, end_date=end)
+    if df.empty:
+        st.info("No data available.")
+        return
+
+    d = with_totals(df)
+    kpi_row(df)
+    st.divider()
+
+    by_station = d.groupby("station")[["Traffic", "Revenue"]].sum().reset_index()
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(by_station, x="station", y="Traffic", color="station", title="Traffic by station",
+                     color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_layout(showlegend=False, height=340, xaxis_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.bar(by_station, x="station", y="Revenue", color="station", title="Revenue by station (Br)",
+                     color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_layout(showlegend=False, height=340, xaxis_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        lanes = {
+            "System": df["exit_sys"].sum() + df["entry_sys"].sum(),
+            "ETC": df["exit_etc"].sum() + df["entry_etc"].sum(),
+            "Manual": df["exit_man"].sum() + df["entry_man"].sum(),
+        }
+        if sum(lanes.values()) > 0:
+            fig = px.pie(values=list(lanes.values()), names=list(lanes.keys()), hole=0.45,
+                         title="Traffic by lane type",
+                         color_discrete_sequence=["#667eea", "#4CAF50", "#FF9800"])
+            fig.update_layout(height=340)
+            st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        pay = {"Cash": df["cash_sys"].sum() + df["cash_man"].sum(), "ETC": df["etc"].sum()}
+        if sum(pay.values()) > 0:
+            fig = px.pie(values=list(pay.values()), names=list(pay.keys()), hole=0.45,
+                         title="Revenue by payment type", color_discrete_sequence=["#667eea", "#f093fb"])
+            fig.update_layout(height=340)
+            st.plotly_chart(fig, use_container_width=True)
+
+    by_shift = d.groupby(["station", "shift"])["Revenue"].sum().reset_index()
+    fig = px.bar(by_shift, x="station", y="Revenue", color="shift", barmode="group",
+                 title="Revenue by station and shift", color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(height=340, xaxis_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+    daily = d.groupby("report_date")[["Traffic", "Revenue"]].sum().reset_index()
+    fig = px.line(daily, x="report_date", y=["Traffic", "Revenue"], markers=True, title="Daily trends",
+                  color_discrete_sequence=["#667eea", "#f5576c"])
+    fig.update_layout(height=340, xaxis_title=None, legend_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def consolidated_page():
+    header("📋 Consolidated Report", "Summary by station", manager=True)
+    start, end = date_range("cons_range")
+    df = get_reports(start_date=start, end_date=end)
+    if df.empty:
+        st.info("No data available.")
+        return
+
+    d = with_totals(df)
+    summary = d.groupby("station").agg(
+        Reports=("id", "count"), Entry=("Entry", "sum"), Exit=("Exit", "sum"),
+        Traffic=("Traffic", "sum"), TrSys=("tr_sys", "sum"), TrEtc=("tr_etc", "sum"),
+        TrMan=("tr_man", "sum"), CashSys=("cash_sys", "sum"), CashEtc=("etc", "sum"),
+        CashMan=("cash_man", "sum"), Revenue=("Revenue", "sum"),
+        GenFuel=("gen_fuel", "sum"), VehFuel=("veh_fuel", "sum"),
+    ).reset_index()
+    total = summary.drop(columns="station").sum().to_frame().T
+    total.insert(0, "station", "TOTAL")
+    summary = pd.concat([summary, total], ignore_index=True)
+
+    n = lambda label, fmt="%d": st.column_config.NumberColumn(label, format=fmt)
+    st.dataframe(
+        summary, hide_index=True, use_container_width=True,
+        column_config={
+            "station": "Station", "Entry": n("Entry"), "Exit": n("Exit"), "Traffic": n("Total Traffic"),
+            "TrSys": n("Traffic System"), "TrEtc": n("Traffic ETC"), "TrMan": n("Traffic Manual"),
+            "CashSys": n("Cash System", "%.2f"), "CashEtc": n("Cash ETC", "%.2f"),
+            "CashMan": n("Cash Manual", "%.2f"), "Revenue": n("Total Revenue (Br)", "%.2f"),
+            "GenFuel": n("Generator Fuel (L)", "%.1f"), "VehFuel": n("Vehicle Fuel (L)", "%.1f"),
+        },
+    )
+    st.download_button("📥 Download CSV", summary.to_csv(index=False), "consolidated.csv", mime="text/csv")
+
+    st.subheader("Revenue by station and shift")
+    pivot = d.pivot_table(index="station", columns="shift", values="Revenue", aggfunc="sum",
+                          fill_value=0, margins=True, margins_name="Total")
+    st.dataframe(pivot, use_container_width=True,
+                 column_config={c: st.column_config.NumberColumn(format="%.2f") for c in pivot.columns})
+
+
+def by_station(df: pd.DataFrame, columns: dict) -> pd.DataFrame:
+    """Sum the given {label: column} per station (all stations listed), with a TOTAL row."""
+    order = STATIONS + [x for x in df["station"].unique() if x not in STATIONS]
+    g = df.groupby("station")[list(columns.values())].sum().reindex(order, fill_value=0)
+    g.columns = list(columns.keys())
+    if len(columns) > 1:
+        g["Total"] = g.sum(axis=1)
+    g = g.reset_index().rename(columns={"station": "Station"})
+    total = g.drop(columns="Station").sum().to_frame().T
+    total.insert(0, "Station", "TOTAL")
+    return pd.concat([g, total], ignore_index=True)
+
+
+def station_report(df: pd.DataFrame, key: str, title: str, columns: dict, unit: str, fmt: str = "%d"):
+    table = by_station(df, columns)
+    st.dataframe(
+        table, hide_index=True, use_container_width=True,
+        column_config={c: st.column_config.NumberColumn(c, format=fmt)
+                       for c in table.columns if c != "Station"},
+    )
+    body = table[table["Station"] != "TOTAL"]
+    parts = list(columns.keys())
+    if len(parts) == 1:
+        fig = px.bar(body, x="Station", y=parts[0], color="Station", title=f"{title} ({unit})",
+                     color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_layout(showlegend=False)
+    else:
+        long = body.melt(id_vars="Station", value_vars=parts, var_name="Type", value_name=unit)
+        fig = px.bar(long, x="Station", y=unit, color="Type", barmode="stack", title=title,
+                     color_discrete_sequence=["#667eea", "#4CAF50", "#FF9800"])
+    fig.update_layout(height=340, xaxis_title=None, margin=dict(t=50, b=10))
+    st.plotly_chart(fig, use_container_width=True, key=f"{key}_chart")
+    st.download_button("📥 Download CSV", table.to_csv(index=False), f"{key}.csv", mime="text/csv",
+                       key=f"{key}_dl")
+
+
+def station_reports_page():
+    header("🏢 Station Reports", "Entry, exit, fuel and paper totals by station", manager=True)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        start, end = date_range("sr_range")
+    shift = c2.selectbox("Shift", ["All"] + SHIFTS, key="sr_shift")
+    df = get_reports(start_date=start, end_date=end, shift=None if shift == "All" else shift)
+    if df.empty:
+        st.info("No reports in this date range.")
+        return
+
+    tabs = st.tabs(["⬇️ Entry Traffic", "⬇️ Entry by Type", "⬆️ Exit Traffic", "⬆️ Exit by Type",
+                    "⚡ Generator Fuel", "⛽ Vehicle Fuel", "🧾 Exit Paper", "🧾 Entry Paper"])
+    by_type = lambda side: {"System": f"{side}_sys", "ETC": f"{side}_etc", "Manual": f"{side}_man"}
+
+    with tabs[0]:
+        d = df.assign(entry_total=df["entry_sys"] + df["entry_etc"] + df["entry_man"])
+        station_report(d, "entry_traffic", "Entry traffic flow by station",
+                       {"Entry traffic": "entry_total"}, "vehicles")
+    with tabs[1]:
+        station_report(df, "entry_by_type", "Entry traffic flow by system, manual and ETC",
+                       by_type("entry"), "vehicles")
+    with tabs[2]:
+        d = df.assign(exit_total=df["exit_sys"] + df["exit_etc"] + df["exit_man"])
+        station_report(d, "exit_traffic", "Exit traffic flow by station",
+                       {"Exit traffic": "exit_total"}, "vehicles")
+    with tabs[3]:
+        station_report(df, "exit_by_type", "Exit traffic flow by system, manual and ETC",
+                       by_type("exit"), "vehicles")
+    with tabs[4]:
+        station_report(df, "generator_fuel", "Generator fuel by station",
+                       {"Generator fuel (L)": "gen_fuel"}, "litres", "%.1f")
+    with tabs[5]:
+        station_report(df, "vehicle_fuel", "Vehicle fuel by station",
+                       {"Vehicle fuel (L)": "veh_fuel"}, "litres", "%.1f")
+    with tabs[6]:
+        station_report(df, "exit_paper", "Exit thermal paper by station",
+                       {"Exit paper (rolls)": "thermal_exit"}, "rolls")
+    with tabs[7]:
+        station_report(df, "entry_paper", "Entry thermal paper by station",
+                       {"Entry paper (rolls)": "thermal_entry"}, "rolls")
+
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
+
+
+def validate_user_fields(fname, lname, username, exclude_id=None):
+    errors = []
+    f, l, u = fname.strip(), lname.strip(), username.strip()
+    if not f:
+        errors.append("First name is required")
+    if not l:
+        errors.append("Last name is required")
+    if not USERNAME_RE.match(u):
+        errors.append("Username must be 3–30 characters: letters, numbers, dot, dash or underscore")
+    if f and l and f.lower() == l.lower():
+        errors.append("First name and last name must be different")
+    if u.lower() in (f.lower(), l.lower()):
+        errors.append("Username must be different from first and last name")
+    if USERNAME_RE.match(u) and username_taken(u, exclude_id):
+        errors.append(f"Username '{u}' already exists")
+    return errors
+
+
+def users_page():
+    me = current_user()
+    header("👥 User Management", "Create, edit, activate or deactivate users", manager=True)
+    list_tab, add_tab, edit_tab = st.tabs(["📋 All users", "➕ Add user", "✏️ Edit user"])
+
+    with list_tab:
+        df = get_all_users()
+        active = int((df["is_active"] == 1).sum())
+        m = st.columns(4)
+        m[0].metric("Total", len(df))
+        m[1].metric("🟢 Active", active)
+        m[2].metric("🔴 Inactive", len(df) - active)
+        m[3].metric("👑 / 🛡️", f"{(df['role'] == 'manager').sum()} / {(df['role'] == 'supervisor').sum()}")
+
+        view = df.assign(
+            Name=(df["fname"] + " " + df["lname"]).str.strip(),
+            Status=df["is_active"].map({1: "🟢 Active", 0: "🔴 Inactive"}),
+            Role=df["role"].str.title(),
+        )[["Name", "username", "station", "Role", "Status", "created_at"]]
+        event = st.dataframe(
+            view, hide_index=True, use_container_width=True, on_select="rerun",
+            selection_mode="single-row", key="users_table",
+            column_config={"username": "Username", "station": "Station", "created_at": "Created"},
+        )
+        rows = event.selection.rows
+        if rows:
+            sel = df.iloc[rows[0]]
+            is_self = int(sel["id"]) == me["id"]
+            with st.container(border=True):
+                st.write(f"**{sel['fname']} {sel['lname']}** (@{sel['username']})")
+                if sel["is_active"]:
+                    if st.button("🔴 Deactivate", disabled=is_self,
+                                 help="You can't deactivate your own account." if is_self else None):
+                        ok, msg = set_user_active(int(sel["id"]), False, actor())
+                        flash(msg, "✅" if ok else "❌")
+                        st.rerun()
+                else:
+                    if st.button("🟢 Activate", type="primary"):
+                        ok, msg = set_user_active(int(sel["id"]), True, actor())
+                        flash(msg, "✅" if ok else "❌")
+                        st.rerun()
+        else:
+            st.caption("Select a user to activate or deactivate them.")
+        st.download_button("📥 Download users", df.to_csv(index=False), "users.csv", mime="text/csv")
+
+    with add_tab:
+        st.caption("New users must choose their own password at first login.")
+        with st.form("add_user_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                fname = st.text_input("First name", placeholder="e.g., Abebe")
+                lname = st.text_input("Last name", placeholder="e.g., Kebede")
+                username = st.text_input("Username", placeholder="e.g., abebe.k")
+            with c2:
+                password = st.text_input("Temporary password", type="password",
+                                         placeholder=f"Min {MIN_PASSWORD} characters")
+                station = st.selectbox("Station", STATIONS + [ALL_STATIONS])
+                role = st.selectbox("Role", ["supervisor", "manager"])
+            if st.form_submit_button("➕ Create user", type="primary", use_container_width=True):
+                errors = validate_user_fields(fname, lname, username)
+                if len(password) < MIN_PASSWORD:
+                    errors.append(f"Password must be at least {MIN_PASSWORD} characters")
+                if role == "supervisor" and station == ALL_STATIONS:
+                    pass  # allowed: supervisor picks the station when submitting
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    ok, msg = create_user(fname.strip(), lname.strip(), username.strip(), password,
+                                          station, role, actor())
+                    if ok:
+                        flash(f"User @{username.strip()} created", "🎉")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    with edit_tab:
+        df = get_all_users()
+        labels = {f"{r.fname} {r.lname} (@{r.username})": int(r.id) for r in df.itertuples()}
+        choice = st.selectbox("Select user", list(labels.keys()))
+        uid = labels[choice]
+        u = get_user(user_id=uid)
+        is_self = uid == me["id"]
+        if is_self:
+            st.info("This is your own account — username and role can't be changed here.")
+
+        with st.form(f"edit_user_{uid}"):
+            c1, c2 = st.columns(2)
+            with c1:
+                n_f = st.text_input("First name", value=u["fname"])
+                n_l = st.text_input("Last name", value=u["lname"])
+                n_u = st.text_input("Username", value=u["username"], disabled=is_self)
+            with c2:
+                stations = STATIONS + [ALL_STATIONS]
+                n_s = st.selectbox("Station", stations,
+                                   index=stations.index(u["station"]) if u["station"] in stations else 0)
+                roles = ["supervisor", "manager"]
+                n_r = st.selectbox("Role", roles, index=roles.index(u["role"]) if u["role"] in roles else 0,
+                                   disabled=is_self)
+            n_pw = st.text_input("Reset password (optional)", type="password",
+                                 placeholder="Leave empty to keep the current password")
+            if st.form_submit_button("💾 Save changes", type="primary", use_container_width=True):
+                errors = validate_user_fields(n_f, n_l, u["username"] if is_self else n_u, exclude_id=uid)
+                if n_pw and len(n_pw) < MIN_PASSWORD:
+                    errors.append(f"Password must be at least {MIN_PASSWORD} characters")
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    ok, msg = update_user(uid, n_f.strip(), n_l.strip(),
+                                          u["username"] if is_self else n_u.strip(), n_s,
+                                          u["role"] if is_self else n_r, n_pw or None, actor())
+                    if ok:
+                        flash(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+
+ACTION_ICONS = [
+    ("LOGIN_FAILED", "⚠️"), ("LOGIN", "🔑"), ("LOGOUT", "🚪"), ("CHANGE_PASSWORD", "🔐"),
+    ("UNSETTLE", "🔓"), ("SETTLE", "🔒"), ("DEACTIVATE", "⛔"), ("ACTIVATE", "✅"),
+    ("DELETE", "🗑️"), ("CREATE", "➕"), ("UPDATE", "✏️"),
+]
+AUDIT_ACTIONS = [
+    "LOGIN", "LOGOUT", "LOGIN_FAILED", "CREATE_USER", "UPDATE_USER", "ACTIVATE_USER", "DEACTIVATE_USER",
+    "CHANGE_PASSWORD", "CREATE_REPORT", "UPDATE_REPORT", "SETTLE_REPORT", "UNSETTLE_REPORT",
+    "CREATE_UNPAID", "UPDATE_UNPAID_STATUS", "DELETE_UNPAID",
+]
+
+
+def action_label(action: str) -> str:
+    for key, icon in ACTION_ICONS:
+        if action.startswith(key) or action.endswith(key) or key in action:
+            return f"{icon} {action}"
+    return f"ℹ️ {action}"
+
+
+def audit_log_page():
+    header("📋 Audit Log", "All system activity", manager=True)
+    c1, c2, c3 = st.columns([1, 1, 2])
+    username = c1.text_input("Username", placeholder="All users").strip() or None
+    action = c2.selectbox("Action", ["All"] + AUDIT_ACTIONS)
+    with c3:
+        start, end = date_range("log_range", days=7)
+    limit = st.slider("Max entries", 50, 2000, 300, step=50)
+
+    df = get_audit_log(limit=limit, username=username, action=None if action == "All" else action,
+                       start_date=start, end_date=end)
+    if df.empty:
+        st.info("No log entries for these filters.")
+        return
+
+    m = st.columns(4)
+    m[0].metric("Entries", len(df))
+    m[1].metric("Unique users", df["username"].nunique())
+    m[2].metric("Action types", df["action"].nunique())
+    m[3].metric("⚠️ Failed logins", int((df["action"] == "LOGIN_FAILED").sum()))
+
+    view = df.assign(Action=df["action"].map(action_label))[
+        ["timestamp", "username", "role", "Action", "target_name", "details", "station"]]
+    st.dataframe(
+        view, hide_index=True, use_container_width=True, height=520,
+        column_config={
+            "timestamp": "When", "username": "User", "role": "Role",
+            "target_name": "Target", "details": st.column_config.TextColumn("Details", width="large"),
+            "station": "Station",
+        },
+    )
+    st.download_button("📥 Download CSV", df.to_csv(index=False),
+                       f"audit_log_{datetime.now():%Y%m%d_%H%M%S}.csv", mime="text/csv")
+
+
+# ===================================================================
+# MAIN
+# ===================================================================
+def build_pages(user):
+    P = st.Page
+    if user["role"] == "manager":
+        return {
+            "Overview": [
+                P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True),
+                P(analytics_page, title="Analytics", icon="📈", url_path="analytics"),
+                P(consolidated_page, title="Consolidated", icon="📋", url_path="consolidated"),
+                P(station_reports_page, title="Station Reports", icon="🏢", url_path="station-reports"),
+            ],
+            "Operations": [
+                P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
+                P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
+                P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid"),
+            ],
+            "Admin": [
+                P(users_page, title="Users", icon="👥", url_path="users"),
+                P(audit_log_page, title="Audit Log", icon="🧾", url_path="audit"),
+            ],
+        }
+    return [
+        P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True),
+        P(submit_page, title="Submit Report", icon="📝", url_path="submit"),
+        P(my_reports_page, title="My Reports", icon="📋", url_path="my-reports"),
+        P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid"),
+    ]
+
+
+def main():
+    init_once()
+    user = current_user()
+    if user is None:
+        login_view()
+        show_flash()
+        return
+    if user["must_change_password"]:
+        force_password_view(user)
+        return
+
+    nav = st.navigation(build_pages(user))
+    sidebar_footer(user)
+    show_flash()
+    nav.run()
+    st.caption("© 2026 Toll Operations Manager")
+
+
+main()
