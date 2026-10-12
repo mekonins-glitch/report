@@ -32,6 +32,14 @@ STATIONS = ["Modjo East", "Koka", "Bote", "Meki", "Batu"]
 ALL_STATIONS = "All Stations"
 SHIFTS = ["A", "B", "C"]
 VEHICLE_TYPES = ["V1", "V2", "V3", "V4", "V5", "V6", "V7"]
+ROLE_SUPERVISOR = "supervisor"
+ROLE_STATION = "station_manager"
+ROLE_ADMIN = "manager"  # stored value kept for existing databases; shown as "Super Admin"
+ROLE_LABELS = {
+    ROLE_SUPERVISOR: "🛡️ Supervisor",
+    ROLE_STATION: "🏢 Station Manager",
+    ROLE_ADMIN: "👑 Super Admin",
+}
 MIN_PASSWORD = 6
 PBKDF2_ITERS = 200_000
 MAX_FAILED_LOGINS = 5
@@ -238,6 +246,12 @@ def setup_database():
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         for stmt in INDEXES:
             conn.execute(stmt)
+        # A Super Admin sees every station. Older "manager" accounts tied to one station were
+        # really station managers, so convert them.
+        conn.execute(
+            "UPDATE users SET role = 'station_manager' WHERE role = 'manager' AND station != ?",
+            (ALL_STATIONS,),
+        )
         if not conn.execute("SELECT 1 FROM users WHERE username = 'admin'").fetchone():
             conn.execute(
                 """INSERT INTO users (fname, lname, username, password_hash, station, role,
@@ -248,7 +262,7 @@ def setup_database():
 
 
 @st.cache_resource
-def init_once():
+def init_once(schema_version: int = 3):
     setup_database()
     return True
 
@@ -340,6 +354,8 @@ def username_taken(username: str, exclude_id=None) -> bool:
 
 
 def create_user(fname, lname, username, password, station, role, who):
+    if role == ROLE_ADMIN:
+        station = ALL_STATIONS
     try:
         with db() as conn:
             cur = conn.execute(
@@ -358,6 +374,8 @@ def create_user(fname, lname, username, password, station, role, who):
 
 
 def update_user(user_id, fname, lname, username, station, role, new_password, who):
+    if role == ROLE_ADMIN:
+        station = ALL_STATIONS
     try:
         with db() as conn:
             old = conn.execute("SELECT fname, lname, username FROM users WHERE id = ?",
@@ -661,9 +679,32 @@ def date_range(key: str, days: int = 30, label: str = "Date range"):
     return rng[0].isoformat(), rng[1].isoformat()
 
 
+def is_admin(user) -> bool:
+    """Super Admin: sees everything, manages users. Must not be tied to a single station."""
+    return user["role"] == ROLE_ADMIN and user["station"] == ALL_STATIONS
+
+
+def can_manage(user) -> bool:
+    """Super Admin or Station Manager: settle shifts, manage unpaid vehicles, view reports."""
+    return user["role"] in (ROLE_ADMIN, ROLE_STATION)
+
+
 def own_station(user):
-    """Station filter for the user (None = all)."""
-    return None if user["role"] == "manager" or user["station"] == ALL_STATIONS else user["station"]
+    """Station filter for the user (None = all stations)."""
+    if is_admin(user) or user["station"] == ALL_STATIONS:
+        return None
+    return user["station"]
+
+
+def station_filter(user, key, container=None, label="Station"):
+    """Station picker. Super Admin chooses; a Station Manager is locked to their own station.
+    Returns the station name, or None for all stations."""
+    box = container if container is not None else st
+    if is_admin(user):
+        pick = box.selectbox(label, [ALL_STATIONS] + STATIONS, key=key)
+        return None if pick == ALL_STATIONS else pick
+    box.selectbox(label, [user["station"]], key=key, disabled=True)
+    return user["station"]
 
 
 def with_totals(df: pd.DataFrame) -> pd.DataFrame:
@@ -840,7 +881,7 @@ def sidebar_footer(user):
         st.divider()
         st.markdown(f"**{display_name(user)}**")
         st.caption(f"@{user['username']} · 📍 {user['station']}")
-        st.caption("👑 Manager" if user["role"] == "manager" else "🛡️ Supervisor")
+        st.caption(ROLE_LABELS.get(user["role"], user["role"]))
 
         with st.expander("🔑 Change password"):
             with st.form("change_pw", clear_on_submit=True):
@@ -864,17 +905,16 @@ def sidebar_footer(user):
 # ===================================================================
 def dashboard_page():
     user = current_user()
-    is_mgr = user["role"] == "manager"
+    is_mgr = can_manage(user)
     header("📊 Dashboard", f"Welcome, {user['fname'] or user['username']}", manager=is_mgr)
 
     c1, c2 = st.columns([2, 1])
     with c1:
         start, end = date_range("dash_range", days=30 if is_mgr else 7)
     station = own_station(user)
-    if is_mgr:
+    if is_admin(user):
         with c2:
-            pick = st.selectbox("Station", [ALL_STATIONS] + STATIONS, key="dash_station")
-            station = None if pick == ALL_STATIONS else pick
+            station = station_filter(user, "dash_station")
 
     df = get_reports(station=station, start_date=start, end_date=end)
     kpi_row(df)
@@ -909,7 +949,7 @@ def dashboard_page():
 
 def unpaid_page():
     user = current_user()
-    is_mgr = user["role"] == "manager"
+    is_mgr = can_manage(user)
     header("🚫 Unpaid Vehicles",
            "Manage unpaid vehicles" if is_mgr else f"Station: {user['station']}", manager=is_mgr)
     list_tab, add_tab = st.tabs(["📋 List", "➕ Add vehicle"])
@@ -921,10 +961,9 @@ def unpaid_page():
         with c2:
             status = st.selectbox("Status", ["All", "unpaid", "paid"], key="unp_status")
         station = own_station(user)
-        if is_mgr:
+        if is_admin(user):
             with c3:
-                pick = st.selectbox("Station", [ALL_STATIONS] + STATIONS, key="unp_station")
-                station = None if pick == ALL_STATIONS else pick
+                station = station_filter(user, "unp_station")
 
         df = get_unpaid(station=station, start_date=start, end_date=end, status=status).reset_index(drop=True)
         if df.empty:
@@ -991,7 +1030,7 @@ def unpaid_page():
             with c1:
                 number = st.text_input("Vehicle number", placeholder="e.g., AA-1234")
                 vtype = st.selectbox("Vehicle type", VEHICLE_TYPES)
-                if is_mgr or user["station"] == ALL_STATIONS:
+                if is_admin(user) or user["station"] == ALL_STATIONS:
                     station_in = st.selectbox("Station", STATIONS)
                 else:
                     station_in = user["station"]
@@ -1202,11 +1241,12 @@ def my_reports_page():
 # MANAGER PAGES
 # ===================================================================
 def reports_page():
+    user = current_user()
     header("📈 Reports", "All station reports", manager=True)
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     with c1:
         start, end = date_range("rep_range")
-    station = c2.selectbox("Station", [ALL_STATIONS] + STATIONS, key="rep_station")
+    station = station_filter(user, "rep_station", container=c2) or ALL_STATIONS
     shift = c3.selectbox("Shift", ["All"] + SHIFTS, key="rep_shift")
     status = c4.selectbox("Status", ["All", "Settled", "Open"], key="rep_status")
 
@@ -1226,11 +1266,12 @@ def reports_page():
 
 
 def settle_page():
+    user = current_user()
     header("🔒 Settle Shifts", "Lock shifts so supervisors can no longer edit them", manager=True)
     c1, c2 = st.columns([2, 1])
     with c1:
         start, end = date_range("settle_range", days=7)
-    station = c2.selectbox("Station", [ALL_STATIONS] + STATIONS, key="settle_station")
+    station = station_filter(user, "settle_station", container=c2) or ALL_STATIONS
 
     df = get_reports(station=None if station == ALL_STATIONS else station,
                      start_date=start, end_date=end).reset_index(drop=True)
@@ -1279,11 +1320,12 @@ def confirm_settle_all(ids):
 
 
 def analytics_page():
+    user = current_user()
     header("📊 Analytics", "Charts & comparisons", manager=True)
     c1, c2 = st.columns([2, 1])
     with c1:
         start, end = date_range("ana_range")
-    station = c2.selectbox("Station", [ALL_STATIONS] + STATIONS, key="ana_station")
+    station = station_filter(user, "ana_station", container=c2) or ALL_STATIONS
     df = get_reports(station=None if station == ALL_STATIONS else station, start_date=start, end_date=end)
     if df.empty:
         st.info("No data available.")
@@ -1343,7 +1385,7 @@ def analytics_page():
 def consolidated_page():
     header("📋 Consolidated Report", "Summary by station", manager=True)
     start, end = date_range("cons_range")
-    df = get_reports(start_date=start, end_date=end)
+    df = get_reports(station=own_station(current_user()), start_date=start, end_date=end)
     if df.empty:
         st.info("No data available.")
         return
@@ -1422,7 +1464,8 @@ def station_reports_page():
     with c1:
         start, end = date_range("sr_range")
     shift = c2.selectbox("Shift", ["All"] + SHIFTS, key="sr_shift")
-    df = get_reports(start_date=start, end_date=end, shift=None if shift == "All" else shift)
+    df = get_reports(station=own_station(current_user()), start_date=start, end_date=end,
+                     shift=None if shift == "All" else shift)
     if df.empty:
         st.info("No reports in this date range.")
         return
@@ -1492,12 +1535,14 @@ def users_page():
         m[0].metric("Total", len(df))
         m[1].metric("🟢 Active", active)
         m[2].metric("🔴 Inactive", len(df) - active)
-        m[3].metric("👑 / 🛡️", f"{(df['role'] == 'manager').sum()} / {(df['role'] == 'supervisor').sum()}")
+        m[3].metric("👑 / 🏢 / 🛡️", f"{(df['role'] == ROLE_ADMIN).sum()} / "
+                                   f"{(df['role'] == ROLE_STATION).sum()} / {(df['role'] == ROLE_SUPERVISOR).sum()}",
+                    help="Super Admins / Station Managers / Supervisors")
 
         view = df.assign(
             Name=(df["fname"] + " " + df["lname"]).str.strip(),
             Status=df["is_active"].map({1: "🟢 Active", 0: "🔴 Inactive"}),
-            Role=df["role"].str.title(),
+            Role=df["role"].map(ROLE_LABELS).fillna(df["role"]),
         )[["Name", "username", "station", "Role", "Status", "created_at"]]
         event = st.dataframe(
             view, hide_index=True, use_container_width=True, on_select="rerun",
@@ -1527,6 +1572,17 @@ def users_page():
 
     with add_tab:
         st.caption("New users must choose their own password at first login.")
+        ROLE_HELP = {
+            ROLE_SUPERVISOR: "Submits shift reports for their station and adds unpaid vehicles.",
+            ROLE_STATION: "Views reports and analytics, settles shifts and manages unpaid vehicles "
+                          "for ONE station.",
+            ROLE_ADMIN: "Full access to all stations, users and the audit log.",
+        }
+        # Role is chosen outside the form so the Station field can react to it.
+        role = st.radio("Role", list(ROLE_LABELS), format_func=ROLE_LABELS.get, horizontal=True,
+                        key="new_user_role")
+        st.info(ROLE_HELP[role])
+
         with st.form("add_user_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
@@ -1536,14 +1592,20 @@ def users_page():
             with c2:
                 password = st.text_input("Temporary password", type="password",
                                          placeholder=f"Min {MIN_PASSWORD} characters")
-                station = st.selectbox("Station", STATIONS + [ALL_STATIONS])
-                role = st.selectbox("Role", ["supervisor", "manager"])
-            if st.form_submit_button("➕ Create user", type="primary", use_container_width=True):
+                if role == ROLE_ADMIN:
+                    station = ALL_STATIONS
+                    st.text_input("Station", value=ALL_STATIONS, disabled=True)
+                elif role == ROLE_STATION:
+                    station = st.selectbox("Station (the one they manage)", STATIONS)
+                else:
+                    station = st.selectbox("Station", STATIONS + [ALL_STATIONS],
+                                           help="Pick 'All Stations' to let the supervisor choose "
+                                                "the station on each report.")
+            if st.form_submit_button(f"➕ Create {ROLE_LABELS[role].split(' ', 1)[1]}", type="primary",
+                                     use_container_width=True):
                 errors = validate_user_fields(fname, lname, username)
                 if len(password) < MIN_PASSWORD:
                     errors.append(f"Password must be at least {MIN_PASSWORD} characters")
-                if role == "supervisor" and station == ALL_STATIONS:
-                    pass  # allowed: supervisor picks the station when submitting
                 if errors:
                     for e in errors:
                         st.error(e)
@@ -1551,7 +1613,7 @@ def users_page():
                     ok, msg = create_user(fname.strip(), lname.strip(), username.strip(), password,
                                           station, role, actor())
                     if ok:
-                        flash(f"User @{username.strip()} created", "🎉")
+                        flash(f"{ROLE_LABELS[role]} @{username.strip()} created", "🎉")
                         st.rerun()
                     else:
                         st.error(msg)
@@ -1576,15 +1638,17 @@ def users_page():
                 stations = STATIONS + [ALL_STATIONS]
                 n_s = st.selectbox("Station", stations,
                                    index=stations.index(u["station"]) if u["station"] in stations else 0)
-                roles = ["supervisor", "manager"]
+                roles = list(ROLE_LABELS)
                 n_r = st.selectbox("Role", roles, index=roles.index(u["role"]) if u["role"] in roles else 0,
-                                   disabled=is_self)
+                                   format_func=ROLE_LABELS.get, disabled=is_self)
             n_pw = st.text_input("Reset password (optional)", type="password",
                                  placeholder="Leave empty to keep the current password")
             if st.form_submit_button("💾 Save changes", type="primary", use_container_width=True):
                 errors = validate_user_fields(n_f, n_l, u["username"] if is_self else n_u, exclude_id=uid)
                 if n_pw and len(n_pw) < MIN_PASSWORD:
                     errors.append(f"Password must be at least {MIN_PASSWORD} characters")
+                if (u["role"] if is_self else n_r) == ROLE_STATION and n_s == ALL_STATIONS:
+                    errors.append("A Station Manager must be assigned to one specific station")
                 if errors:
                     for e in errors:
                         st.error(e)
@@ -1658,10 +1722,12 @@ def audit_log_page():
 # ===================================================================
 def build_pages(user):
     P = st.Page
-    if user["role"] == "manager":
+    dash = P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True)
+    unpaid = P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid")
+    if is_admin(user):
         return {
             "Overview": [
-                P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True),
+                dash,
                 P(analytics_page, title="Analytics", icon="📈", url_path="analytics"),
                 P(consolidated_page, title="Consolidated", icon="📋", url_path="consolidated"),
                 P(station_reports_page, title="Station Reports", icon="🏢", url_path="station-reports"),
@@ -1669,18 +1735,32 @@ def build_pages(user):
             "Operations": [
                 P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
                 P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
-                P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid"),
+                unpaid,
             ],
             "Admin": [
                 P(users_page, title="Users", icon="👥", url_path="users"),
                 P(audit_log_page, title="Audit Log", icon="🧾", url_path="audit"),
             ],
         }
+    if user["role"] in (ROLE_STATION, ROLE_ADMIN):  # ROLE_ADMIN here = tied to one station
+        return {
+            "Overview": [
+                dash,
+                P(analytics_page, title="Analytics", icon="📈", url_path="analytics"),
+                P(consolidated_page, title="Consolidated", icon="📋", url_path="consolidated"),
+                P(station_reports_page, title="Station Reports", icon="🏢", url_path="station-reports"),
+            ],
+            "Operations": [
+                P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
+                P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
+                unpaid,
+            ],
+        }
     return [
-        P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True),
+        dash,
         P(submit_page, title="Submit Report", icon="📝", url_path="submit"),
         P(my_reports_page, title="My Reports", icon="📋", url_path="my-reports"),
-        P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid"),
+        unpaid,
     ]
 
 
