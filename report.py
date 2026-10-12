@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
@@ -167,6 +168,7 @@ CREATE TABLE IF NOT EXISTS unpaid_vehicles (
     reason TEXT,
     status TEXT DEFAULT 'unpaid',
     paid_date DATE,
+    paid_by TEXT,
     image_data TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -204,7 +206,7 @@ MIGRATIONS = {
         "settled_at": "TIMESTAMP",
         "settled_by": "TEXT",
     },
-    "unpaid_vehicles": {"image_data": "TEXT"},
+    "unpaid_vehicles": {"image_data": "TEXT", "paid_by": "TEXT"},
 }
 
 INDEXES = [
@@ -246,6 +248,15 @@ def setup_database():
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         for stmt in INDEXES:
             conn.execute(stmt)
+        # Fill "paid by" for vehicles marked paid before this column existed (from the audit log).
+        conn.execute(
+            """UPDATE unpaid_vehicles SET paid_by = (
+                   SELECT username FROM audit_log
+                   WHERE action = 'UPDATE_UNPAID_STATUS' AND target_id = CAST(unpaid_vehicles.id AS TEXT)
+                     AND details LIKE '% as paid'
+                   ORDER BY id DESC LIMIT 1)
+               WHERE status = 'paid' AND paid_by IS NULL"""
+        )
         # A Super Admin sees every station. Older "manager" accounts tied to one station were
         # really station managers, so convert them.
         conn.execute(
@@ -262,7 +273,7 @@ def setup_database():
 
 
 @st.cache_resource
-def init_once(schema_version: int = 3):
+def init_once(schema_version: int = 4):
     setup_database()
     return True
 
@@ -532,7 +543,7 @@ def set_settled(report_ids, settled: bool, who) -> int:
 def get_unpaid(station=None, start_date=None, end_date=None, status=None) -> pd.DataFrame:
     """List query. Images are NOT loaded here (they are large) - see get_unpaid_image."""
     query = """SELECT id, vehicle_number, vehicle_type, station, report_date, shift, supervisor,
-                      amount, reason, status, paid_date, created_at,
+                      amount, reason, status, paid_date, paid_by, created_at,
                       (image_data IS NOT NULL AND image_data != '') AS has_image
                FROM unpaid_vehicles WHERE 1=1"""
     params = []
@@ -582,8 +593,9 @@ def set_unpaid_status(vehicle_id, status, who):
         if not row:
             return
         paid_date = date.today().isoformat() if status == "paid" else None
-        conn.execute("UPDATE unpaid_vehicles SET status=?, paid_date=? WHERE id=?",
-                     (status, paid_date, vehicle_id))
+        paid_by = who[0] if status == "paid" else None
+        conn.execute("UPDATE unpaid_vehicles SET status=?, paid_date=?, paid_by=? WHERE id=?",
+                     (status, paid_date, paid_by, vehicle_id))
         log_action(who, "UPDATE_UNPAID_STATUS", "UNPAID_VEHICLE", vehicle_id, row["vehicle_number"],
                    f"Marked {row['vehicle_number']} as {status}", row["station"], conn=conn)
     st.cache_data.clear()
@@ -1004,7 +1016,8 @@ def unpaid_page():
                         st.write(f"**Amount:** Br {row['amount']:,.2f}")
                         st.write(f"**Reason:** {row['reason'] or 'N/A'}")
                         st.write(f"**Status:** {str(row['status']).upper()}"
-                                 + (f" (paid {row['paid_date']})" if row["paid_date"] else ""))
+                                 + (f" (paid {row['paid_date']}" + (f" by {row['paid_by']}" if row["paid_by"] else "")
+                                 + ")" if row["paid_date"] else ""))
                         if is_mgr:
                             b1, b2 = st.columns(2)
                             new_status = "paid" if row["status"] == "unpaid" else "unpaid"
@@ -1502,6 +1515,71 @@ def station_reports_page():
                        {"Entry paper (rolls)": "thermal_entry"}, "rolls")
 
 
+def make_backup_bytes() -> bytes:
+    """Consistent snapshot of the live database (safe while users are working)."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_FILE, timeout=30)
+        dst = sqlite3.connect(tmp_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def backup_page():
+    user = current_user()
+    header("💾 Database Backup", "Download a full copy of the database", manager=True)
+    if not is_admin(user):
+        st.error("Only a Super Admin can download backups.")
+        return
+
+    with db() as conn:
+        counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("users", "reports", "unpaid_vehicles", "audit_log")}
+    size_mb = os.path.getsize(DB_FILE) / (1024 * 1024) if os.path.exists(DB_FILE) else 0
+    m = st.columns(5)
+    m[0].metric("Database size", f"{size_mb:,.2f} MB")
+    m[1].metric("Users", f"{counts['users']:,}")
+    m[2].metric("Reports", f"{counts['reports']:,}")
+    m[3].metric("Unpaid vehicles", f"{counts['unpaid_vehicles']:,}")
+    m[4].metric("Audit entries", f"{counts['audit_log']:,}")
+
+    st.warning("A backup contains every user, report and photo, including password hashes. "
+               "Store it somewhere safe and do not share it.")
+
+    if st.button("🗄️ Create backup now", type="primary"):
+        try:
+            data = make_backup_bytes()
+            name = f"toll_operations_backup_{datetime.now():%Y%m%d_%H%M%S}.db"
+            st.session_state["_backup"] = (name, data, now_str())
+            log_action(actor(), "BACKUP_CREATE", "DATABASE", None, name,
+                       f"Created database backup ({len(data) / 1024 / 1024:,.2f} MB)")
+        except (sqlite3.Error, OSError) as e:
+            st.error(f"Backup failed: {e}")
+
+    backup = st.session_state.get("_backup")
+    if backup:
+        name, data, created = backup
+        st.success(f"Backup ready: **{name}** ({len(data) / 1024 / 1024:,.2f} MB), created {created}.")
+        st.download_button(
+            "📥 Download backup", data=data, file_name=name, mime="application/octet-stream",
+            type="primary",
+            on_click=lambda: log_action(actor(), "BACKUP_DOWNLOAD", "DATABASE", None, name,
+                                        "Downloaded database backup"),
+        )
+    st.caption("To restore: stop the app, replace toll_operations.db with the backup file, and start the app again.")
+
+
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
 
 
@@ -1664,6 +1742,7 @@ def users_page():
 
 
 ACTION_ICONS = [
+    ("BACKUP", "💾"),
     ("LOGIN_FAILED", "⚠️"), ("LOGIN", "🔑"), ("LOGOUT", "🚪"), ("CHANGE_PASSWORD", "🔐"),
     ("UNSETTLE", "🔓"), ("SETTLE", "🔒"), ("DEACTIVATE", "⛔"), ("ACTIVATE", "✅"),
     ("DELETE", "🗑️"), ("CREATE", "➕"), ("UPDATE", "✏️"),
@@ -1671,7 +1750,7 @@ ACTION_ICONS = [
 AUDIT_ACTIONS = [
     "LOGIN", "LOGOUT", "LOGIN_FAILED", "CREATE_USER", "UPDATE_USER", "ACTIVATE_USER", "DEACTIVATE_USER",
     "CHANGE_PASSWORD", "CREATE_REPORT", "UPDATE_REPORT", "SETTLE_REPORT", "UNSETTLE_REPORT",
-    "CREATE_UNPAID", "UPDATE_UNPAID_STATUS", "DELETE_UNPAID",
+    "CREATE_UNPAID", "UPDATE_UNPAID_STATUS", "DELETE_UNPAID", "BACKUP_CREATE", "BACKUP_DOWNLOAD",
 ]
 
 
@@ -1740,6 +1819,7 @@ def build_pages(user):
             "Admin": [
                 P(users_page, title="Users", icon="👥", url_path="users"),
                 P(audit_log_page, title="Audit Log", icon="🧾", url_path="audit"),
+                P(backup_page, title="Database Backup", icon="💾", url_path="backup"),
             ],
         }
     if user["role"] in (ROLE_STATION, ROLE_ADMIN):  # ROLE_ADMIN here = tied to one station
