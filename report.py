@@ -1673,7 +1673,50 @@ def backup_page():
             on_click=lambda: log_action(actor(), "BACKUP_DOWNLOAD", "DATABASE", None, name,
                                         "Downloaded database backup"),
         )
-    st.caption("To restore: stop the app, replace toll_operations.db with the backup file, and start the app again.")
+    st.caption(f"Live database file: `{os.path.abspath(DB_FILE)}`")
+
+    st.divider()
+    st.subheader("♻️ Restore from a backup")
+    st.warning("Restoring **replaces all current data** (users, reports, unpaid vehicles, logs) "
+               "with the uploaded file. Download a backup first.")
+    up = st.file_uploader("Upload a toll_operations .db backup", type=["db", "sqlite", "sqlite3"],
+                          key="restore_file")
+    if up is not None:
+        confirm = st.checkbox("I understand this will overwrite the current database")
+        if st.button("Restore this backup", type="primary", disabled=not confirm):
+            fd, tmp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            try:
+                with open(tmp_path, "wb") as f:
+                    f.write(up.getvalue())
+                chk = sqlite3.connect(tmp_path)
+                try:
+                    tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if not {"users", "reports"} <= tables:
+                        raise ValueError("File is not a Toll Operations database (users/reports tables missing).")
+                    if chk.execute("SELECT COUNT(*) FROM users WHERE role='manager'").fetchone()[0] == 0:
+                        raise ValueError("Backup has no Super Admin user; restore refused.")
+                    n_rep = chk.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+                    src = chk
+                    dst = sqlite3.connect(DB_FILE, timeout=30)
+                    try:
+                        src.backup(dst)
+                    finally:
+                        dst.close()
+                finally:
+                    chk.close()
+                setup_database()
+                st.cache_data.clear()
+                log_action(actor(), "BACKUP_RESTORE", "DATABASE", None, up.name,
+                           f"Restored database from {up.name} ({n_rep} reports)")
+                st.success(f"Restored {n_rep:,} reports from {up.name}. Reload the page.")
+            except (sqlite3.Error, OSError, ValueError) as e:
+                st.error(f"Restore failed: {e}")
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 # ===================================================================
