@@ -218,6 +218,23 @@ CREATE TABLE IF NOT EXISTS equipment_crashes (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS crv_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date DATE NOT NULL,
+    station TEXT NOT NULL,
+    crv_number TEXT NOT NULL,
+    collector_name TEXT NOT NULL,
+    amount REAL DEFAULT 0,
+    received_date DATE,
+    remark TEXT,
+    status TEXT DEFAULT 'pending',
+    entered_by TEXT NOT NULL,
+    verified_by TEXT,
+    verified_at TIMESTAMP,
+    verify_note TEXT,
+    image_data TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS stakeholder_letters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     stakeholder_name TEXT NOT NULL,
@@ -268,6 +285,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username, action)",
     "CREATE INDEX IF NOT EXISTS idx_crash_station ON equipment_crashes(station, report_date)",
     "CREATE INDEX IF NOT EXISTS idx_crash_status ON equipment_crashes(status)",
+    "CREATE INDEX IF NOT EXISTS idx_crv_station ON crv_records(station, report_date)",
 ]
 
 
@@ -327,11 +345,11 @@ def setup_database():
 
 # Bump this number whenever tables or columns are added. It is part of the cache key below, so the
 # database setup runs again on the next start even if the server process was not restarted.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 REQUIRED_TABLES = {"users", "reports", "unpaid_vehicles", "audit_log",
-                   "equipment_crashes", "stakeholder_letters"}
+                   "equipment_crashes", "stakeholder_letters", "crv_records"}
 
 
 def ensure_schema():
@@ -1991,6 +2009,317 @@ def equipment_page():
 
 
 # ===================================================================
+# CRV (CASH RECEIPT VOUCHER) DAILY CHECK
+# ===================================================================
+CRV_STATUS = ["pending", "verified", "rejected"]
+CRV_STATUS_LABEL = {"pending": "⏳ Pending check", "verified": "✅ Verified", "rejected": "❌ Rejected"}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_crvs(station=None, start_date=None, end_date=None, status=None) -> pd.DataFrame:
+    query = """SELECT id, report_date, station, crv_number, collector_name, amount, received_date,
+                      remark, status, entered_by, created_at, verified_by, verified_at, verify_note,
+                      (image_data IS NOT NULL AND image_data != '') AS has_image
+               FROM crv_records WHERE 1=1"""
+    params = []
+    if station and station != ALL_STATIONS:
+        query += " AND station = ?"
+        params.append(station)
+    if status and status != "All":
+        query += " AND status = ?"
+        params.append(status)
+    if start_date:
+        query += " AND report_date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND report_date <= ?"
+        params.append(end_date)
+    query += " ORDER BY report_date DESC, station, id DESC"
+    with db() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    df["has_image"] = df["has_image"].astype(bool)
+    return df
+
+
+def add_crv(rec: dict, who):
+    with db() as conn:
+        dup = conn.execute("SELECT id FROM crv_records WHERE crv_number = ? AND station = ?",
+                           (rec["crv_number"], rec["station"])).fetchone()
+        if dup:
+            return False, f"CRV number {rec['crv_number']} is already recorded for {rec['station']} (entry #{dup['id']})."
+        cur = conn.execute(
+            """INSERT INTO crv_records (report_date, station, crv_number, collector_name, amount,
+                                        received_date, remark, entered_by, image_data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rec["report_date"], rec["station"], rec["crv_number"], rec["collector_name"], rec["amount"],
+             rec["received_date"], rec["remark"], who[0], rec["image_data"]),
+        )
+        log_action(who, "CREATE_CRV", "CRV", cur.lastrowid, rec["crv_number"],
+                   f"CRV {rec['crv_number']} for {rec['report_date']}: Br {rec['amount']:,.2f} "
+                   f"(collector {rec['collector_name']})", rec["station"], conn=conn)
+    st.cache_data.clear()
+    return True, ""
+
+
+def verify_crv(crv_id, status, note, who, allowed_station=None):
+    with db() as conn:
+        row = conn.execute("SELECT station, crv_number FROM crv_records WHERE id = ?", (crv_id,)).fetchone()
+        if not row:
+            return False, "Record not found."
+        if allowed_station and row["station"] != allowed_station:
+            return False, "You can only check CRVs of your own station."
+        conn.execute(
+            "UPDATE crv_records SET status=?, verify_note=?, verified_by=?, verified_at=? WHERE id=?",
+            (status, note, who[0], now_str(), crv_id),
+        )
+        log_action(who, "VERIFY_CRV", "CRV", crv_id, row["crv_number"],
+                   f"Marked CRV {row['crv_number']} as {status}" + (f": {note[:100]}" if note else ""),
+                   row["station"], conn=conn)
+    st.cache_data.clear()
+    return True, ""
+
+
+def delete_crv(crv_id, who):
+    with db() as conn:
+        row = conn.execute("SELECT station, crv_number FROM crv_records WHERE id = ?", (crv_id,)).fetchone()
+        if not row:
+            return
+        conn.execute("DELETE FROM crv_records WHERE id = ?", (crv_id,))
+        log_action(who, "DELETE_CRV", "CRV", crv_id, row["crv_number"],
+                   f"Deleted CRV {row['crv_number']}", row["station"], conn=conn)
+    st.cache_data.clear()
+
+
+def show_crv_image(crv_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT image_data FROM crv_records WHERE id = ?", (crv_id,)).fetchone()
+    data = row["image_data"] if row else None
+    if not data or len(data.strip()) < 100:
+        st.caption("📷 No photo")
+        return
+    try:
+        st.image(base64.b64decode(data), use_container_width=True)
+    except Exception:  # noqa: BLE001
+        st.caption("📷 Photo could not be displayed")
+
+
+def crv_daily_check(start: str, end: str, station) -> pd.DataFrame:
+    """One row per station per day: cash in shift reports vs CRV total."""
+    stations = [station] if station else STATIONS
+    days = pd.date_range(start, end).strftime("%Y-%m-%d").tolist()
+    rep = get_reports(station=station, start_date=start, end_date=end)
+    if rep.empty:
+        cash = {}
+        n_rep = {}
+    else:
+        rep = rep.assign(_cash=rep["cash_sys"].fillna(0) + rep["cash_man"].fillna(0))
+        cash = rep.groupby(["station", "report_date"])["_cash"].sum().to_dict()
+        n_rep = rep.groupby(["station", "report_date"]).size().to_dict()
+    crv = get_crvs(station=station, start_date=start, end_date=end)
+    if crv.empty:
+        crv_amt, crv_n, crv_pend = {}, {}, {}
+    else:
+        crv_amt = crv.groupby(["station", "report_date"])["amount"].sum().to_dict()
+        crv_n = crv.groupby(["station", "report_date"]).size().to_dict()
+        crv_pend = crv[crv["status"] != "verified"].groupby(["station", "report_date"]).size().to_dict()
+    rows = []
+    for d in days:
+        for s in stations:
+            k = (s, d)
+            c, a = float(cash.get(k, 0)), float(crv_amt.get(k, 0))
+            reports, n = int(n_rep.get(k, 0)), int(crv_n.get(k, 0))
+            if reports == 0 and n == 0:
+                state = "➖ No report"
+            elif n == 0:
+                state = "❌ CRV missing"
+            elif reports == 0:
+                state = "⚠️ CRV without report"
+            elif abs(c - a) < 0.01:
+                state = "✅ Matched" if crv_pend.get(k, 0) == 0 else "🟡 Matched, not verified"
+            else:
+                state = "⚠️ Difference"
+            rows.append({"Date": d, "Station": s, "Reports": reports, "Cash reported": c,
+                         "CRVs": n, "CRV total": a, "Difference": c - a, "Result": state})
+    return pd.DataFrame(rows)
+
+
+@st.dialog("Delete CRV")
+def confirm_delete_crv(crv_id: int, label: str):
+    st.warning(f"Permanently delete **{label}**? This cannot be undone.")
+    c1, c2 = st.columns(2)
+    if c1.button("Delete", type="primary", use_container_width=True):
+        delete_crv(crv_id, actor())
+        flash("CRV deleted", "🗑️")
+        st.rerun()
+    if c2.button("Cancel", use_container_width=True):
+        st.rerun()
+
+
+def crv_page():
+    user = current_user()
+    manage = can_manage(user)
+    header("🧾 CRV — Cash Receipt Vouchers",
+           "Daily check of CRVs collected from Finance" if manage else f"Station: {user['station']}",
+           manager=manage)
+    tab_names = (["✅ Daily check", "📋 CRV list", "➕ Enter CRV"] if manage
+                 else ["➕ Enter CRV", "📋 My station CRVs"])
+    tabs = dict(zip(tab_names, st.tabs(tab_names)))
+
+    if manage:
+        with tabs["✅ Daily check"]:
+            st.caption("Compares the cash (system + manual) in the shift reports with the CRV amounts "
+                       "collected from Finance, for each station and day.")
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                start, end = date_range("crv_chk_range", days=7)
+            with c2:
+                station = station_filter(user, "crv_chk_station")
+            chk = crv_daily_check(start, end, station)
+            active = chk[chk["Result"] != "➖ No report"]
+            m = st.columns(4)
+            m[0].metric("Station-days", len(active))
+            m[1].metric("❌ CRV missing", int((active["Result"] == "❌ CRV missing").sum()))
+            m[2].metric("⚠️ Differences", int(active["Result"].isin(["⚠️ Difference", "⚠️ CRV without report"]).sum()))
+            m[3].metric("Total difference", f"Br {active['Difference'].sum():,.2f}")
+            only_issues = st.toggle("Show only problems", value=True, key="crv_only_issues")
+            shown = active[~active["Result"].isin(["✅ Matched"])] if only_issues else active
+            if shown.empty:
+                st.success("Everything matches for this period." if only_issues else "No data.")
+            else:
+                st.dataframe(
+                    shown.sort_values(["Date", "Station"], ascending=[False, True]),
+                    hide_index=True, use_container_width=True,
+                    column_config={
+                        "Cash reported": st.column_config.NumberColumn(format="%.2f"),
+                        "CRV total": st.column_config.NumberColumn(format="%.2f"),
+                        "Difference": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                st.download_button("📥 Download CSV", shown.to_csv(index=False), "crv_daily_check.csv",
+                                   mime="text/csv")
+
+        list_tab = tabs["📋 CRV list"]
+        enter_tab = tabs["➕ Enter CRV"]
+    else:
+        enter_tab = tabs["➕ Enter CRV"]
+        list_tab = tabs["📋 My station CRVs"]
+
+    with list_tab:
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            start, end = date_range("crv_range", days=30)
+        status = c2.selectbox("Status", ["All"] + CRV_STATUS, key="crv_status",
+                              format_func=lambda s: "All" if s == "All" else CRV_STATUS_LABEL[s])
+        station = own_station(user)
+        if is_admin(user):
+            with c3:
+                station = station_filter(user, "crv_station")
+        df = get_crvs(station=station, start_date=start, end_date=end, status=status).reset_index(drop=True)
+        if df.empty:
+            st.info("No CRVs for these filters.")
+        else:
+            m = st.columns(3)
+            m[0].metric("CRVs", len(df))
+            m[1].metric("Total amount", f"Br {df['amount'].sum():,.2f}")
+            m[2].metric("⏳ Not yet verified", int((df["status"] != "verified").sum()))
+            view = df.assign(Status=df["status"].map(CRV_STATUS_LABEL))[
+                ["report_date", "station", "crv_number", "collector_name", "amount", "received_date",
+                 "Status", "entered_by", "has_image"]]
+            event = st.dataframe(
+                view, hide_index=True, use_container_width=True, on_select="rerun",
+                selection_mode="single-row", key="crv_table",
+                column_config={
+                    "report_date": "Cash of date", "station": "Station", "crv_number": "CRV No.",
+                    "collector_name": "Collector", "amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+                    "received_date": "Collected on", "entered_by": "Entered by",
+                    "has_image": st.column_config.CheckboxColumn("Photo", width="small"),
+                },
+            )
+            st.caption("Select a row for details" + (" and to verify it." if manage else "."))
+            rows = event.selection.rows
+            if rows:
+                row = df.iloc[rows[0]]
+                cid = int(row["id"])
+                with st.container(border=True):
+                    left, right = st.columns([2, 1])
+                    with left:
+                        st.subheader(f"CRV {row['crv_number']} · {row['station']}")
+                        st.write(f"**Cash of date:** {row['report_date']} · **Collected on:** {row['received_date']}")
+                        st.write(f"**Collector:** {row['collector_name']} · **Amount:** Br {row['amount']:,.2f}")
+                        st.write(f"**Remark:** {row['remark'] or '-'}")
+                        st.write(f"**Entered by:** {row['entered_by']} ({row['created_at']})")
+                        st.write(f"**Status:** {CRV_STATUS_LABEL[row['status']]}"
+                                 + (f" — {row['verified_by']} on {row['verified_at']}" if row["verified_by"] else ""))
+                        if row["verify_note"]:
+                            st.write(f"**Check note:** {row['verify_note']}")
+                    with right:
+                        if row["has_image"]:
+                            show_crv_image(cid)
+                        else:
+                            st.caption("📷 No photo")
+                    if manage:
+                        st.divider()
+                        with st.form(f"crv_verify_{cid}"):
+                            v1, v2 = st.columns([1, 2])
+                            new_status = v1.selectbox("Check result", CRV_STATUS,
+                                                      index=CRV_STATUS.index(row["status"]),
+                                                      format_func=CRV_STATUS_LABEL.get)
+                            note = v2.text_input("Note", value=row["verify_note"] or "")
+                            if st.form_submit_button("💾 Save check", type="primary", use_container_width=True):
+                                ok, msg = verify_crv(cid, new_status, note.strip(), actor(),
+                                                     allowed_station=own_station(user))
+                                if ok:
+                                    flash("CRV check saved")
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                        if is_admin(user) and st.button("🗑️ Delete this CRV", key=f"crv_del_{cid}"):
+                            confirm_delete_crv(cid, f"CRV {row['crv_number']} ({row['report_date']})")
+            st.download_button("📥 Download CSV", df.drop(columns=["has_image"]).to_csv(index=False),
+                               "crv_records.csv", mime="text/csv")
+
+    with enter_tab:
+        with st.form("crv_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                if is_admin(user) or user["station"] == ALL_STATIONS:
+                    station_in = st.selectbox("Station", STATIONS)
+                else:
+                    station_in = user["station"]
+                    st.text_input("Station", value=station_in, disabled=True)
+                crv_no = st.text_input("CRV number *", placeholder="Number printed on the voucher")
+                collector = st.text_input("Toll collector name *", value=display_name(user) if not manage else "")
+            with c2:
+                rdate = st.date_input("Cash of date (business day)", value=date.today() - timedelta(days=1),
+                                      max_value=date.today(), help="The day the cash was collected at the plaza")
+                recv = st.date_input("Date collected from Finance", value=date.today(), max_value=date.today())
+                amount = st.number_input("CRV amount (Br) *", min_value=0.0, step=100.0, format="%.2f")
+            remark = st.text_area("Remark", placeholder="Optional")
+            photo = st.file_uploader("📷 Photo of the CRV (optional)", type=["jpg", "jpeg", "png"], key="crv_photo")
+            if st.form_submit_button("➕ Save CRV", type="primary", use_container_width=True):
+                if not crv_no.strip() or not collector.strip() or amount <= 0:
+                    st.error("CRV number, collector name and an amount above 0 are required.")
+                else:
+                    image_data, err = (None, None)
+                    if photo is not None:
+                        image_data, err = process_image(photo)
+                    if err:
+                        st.error(err)
+                    else:
+                        ok, msg = add_crv({
+                            "report_date": rdate.isoformat(), "station": station_in,
+                            "crv_number": crv_no.strip(), "collector_name": collector.strip(),
+                            "amount": float(amount), "received_date": recv.isoformat(),
+                            "remark": remark.strip(), "image_data": image_data,
+                        }, actor())
+                        if ok:
+                            flash(f"CRV {crv_no.strip()} saved", "🧾")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+
+# ===================================================================
 # STAKEHOLDER FOLLOW-UP LETTERS (Super Admin)
 # ===================================================================
 LETTER_TITLES = ["Mr.", "Ms.", "Dr.", "Eng.", "Ato", "W/ro", "(none)"]
@@ -2482,6 +2811,7 @@ def build_pages(user):
     dash = P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True)
     unpaid = P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid")
     crash = P(equipment_page, title="Equipment Crash", icon="🛠️", url_path="equipment")
+    crv = P(crv_page, title="CRV Check", icon="🧾", url_path="crv")
     if is_admin(user):
         return {
             "Overview": [
@@ -2495,6 +2825,7 @@ def build_pages(user):
                 P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
                 unpaid,
                 crash,
+                crv,
             ],
             "Admin": [
                 P(users_page, title="Users", icon="👥", url_path="users"),
@@ -2516,6 +2847,7 @@ def build_pages(user):
                 P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
                 unpaid,
                 crash,
+                crv,
             ],
         }
     return [
@@ -2524,6 +2856,7 @@ def build_pages(user):
         P(my_reports_page, title="My Reports", icon="📋", url_path="my-reports"),
         unpaid,
         crash,
+        crv,
     ]
 
 
