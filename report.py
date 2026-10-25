@@ -33,6 +33,16 @@ STATIONS = ["Modjo East", "Koka", "Bote", "Meki", "Batu"]
 ALL_STATIONS = "All Stations"
 SHIFTS = ["A", "B", "C"]
 VEHICLE_TYPES = ["V1", "V2", "V3", "V4", "V5", "V6", "V7"]
+
+EQUIPMENT_TYPES = [
+    "Barrier gate", "Card reader / RFID", "Ticket / card printer", "Camera / CCTV",
+    "Vehicle detector / loop", "Lane controller / computer", "ETC antenna", "Display / signage",
+    "Traffic light", "UPS / battery", "Generator", "Network / server", "Alarm / fire safety", "Other",
+]
+SEVERITIES = ["Low", "Medium", "High", "Critical"]
+SEVERITY_ICON = {"Low": "🟢", "Medium": "🟡", "High": "🟠", "Critical": "🔴"}
+CRASH_STATUS = ["open", "in_progress", "resolved"]
+CRASH_STATUS_LABEL = {"open": "🔴 Open", "in_progress": "🟡 In progress", "resolved": "🟢 Resolved"}
 ROLE_SUPERVISOR = "supervisor"
 ROLE_STATION = "station_manager"
 ROLE_ADMIN = "manager"  # stored value kept for existing databases; shown as "Super Admin"
@@ -55,7 +65,7 @@ FLOAT_FIELDS = [
     "forged_amt", "overload_amt", "gen_hour",
 ]
 NUM_FIELDS = INT_FIELDS + FLOAT_FIELDS
-TEXT_FIELDS = ["gen_operator", "gen_remark", "good_notes", "problems", "solution"]
+TEXT_FIELDS = ["gen_operator", "gen_remark", "good_notes", "problems", "solution", "notes_by", "notes_at"]
 
 # Traffic = system + ETC + manual lanes, entry and exit.
 TRAFFIC_COLS = ["exit_sys", "entry_sys", "exit_etc", "entry_etc", "exit_man", "entry_man"]
@@ -151,6 +161,7 @@ CREATE TABLE IF NOT EXISTS reports (
     overload_count INTEGER DEFAULT 0, overload_amt REAL DEFAULT 0,
     gen_hour REAL DEFAULT 0,
     good_notes TEXT, problems TEXT, solution TEXT,
+    notes_by TEXT, notes_at TEXT,
     is_settled INTEGER DEFAULT 0,
     settled_at TIMESTAMP,
     settled_by TEXT,
@@ -185,6 +196,44 @@ CREATE TABLE IF NOT EXISTS audit_log (
     station TEXT,
     ip_address TEXT
 );
+CREATE TABLE IF NOT EXISTS equipment_crashes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date DATE NOT NULL,
+    report_time TEXT,
+    station TEXT NOT NULL,
+    shift TEXT,
+    lane TEXT,
+    equipment_type TEXT NOT NULL,
+    equipment_detail TEXT,
+    problem TEXT NOT NULL,
+    severity TEXT DEFAULT 'Medium',
+    lane_closed INTEGER DEFAULT 0,
+    downtime_hours REAL DEFAULT 0,
+    reported_by TEXT NOT NULL,
+    status TEXT DEFAULT 'open',
+    action_taken TEXT,
+    resolved_by TEXT,
+    resolved_at TIMESTAMP,
+    image_data TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS stakeholder_letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stakeholder_name TEXT NOT NULL,
+    position TEXT,
+    organization TEXT,
+    email TEXT,
+    letter_sent_date DATE,
+    reminder_sent_date DATE,
+    reply_date DATE,
+    reply_summary TEXT,
+    action_agreed TEXT,
+    status TEXT DEFAULT 'sent',
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP
+);
 """
 
 # Columns older versions of the database may be missing.
@@ -201,6 +250,8 @@ MIGRATIONS = {
         "thermal_entry": "INTEGER DEFAULT 0",
         "gen_operator": "TEXT",
         "gen_remark": "TEXT",
+        "notes_by": "TEXT",
+        "notes_at": "TEXT",
         "veh_odo": "REAL DEFAULT 0",
         "is_settled": "INTEGER DEFAULT 0",
         "settled_at": "TIMESTAMP",
@@ -215,6 +266,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_unpaid_station ON unpaid_vehicles(station, report_date)",
     "CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username, action)",
+    "CREATE INDEX IF NOT EXISTS idx_crash_station ON equipment_crashes(station, report_date)",
+    "CREATE INDEX IF NOT EXISTS idx_crash_status ON equipment_crashes(status)",
 ]
 
 
@@ -273,7 +326,7 @@ def setup_database():
 
 
 @st.cache_resource
-def init_once(schema_version: int = 4):
+def init_once(schema_version: int = 6):
     setup_database()
     return True
 
@@ -684,7 +737,8 @@ def display_name(user) -> str:
 
 def date_range(key: str, days: int = 30, label: str = "Date range"):
     today = date.today()
-    rng = st.date_input(label, value=(today - timedelta(days=days), today), key=key)
+    week_start = today - timedelta(days=today.weekday())  # this week's Monday
+    rng = st.date_input(label, value=(week_start, today), key=key)  # Monday to today (Sunday on Sundays)
     if not isinstance(rng, (list, tuple)) or len(rng) != 2:
         st.info("Pick both a start date and an end date.")
         st.stop()
@@ -789,17 +843,52 @@ def report_table(df: pd.DataFrame, key: str, selectable: bool = False, show_stat
     return None
 
 
+def time_ago(ts) -> str:
+    """'2026-10-15 14:14:50' -> '4 days 7 hours ago' (days and hours, or minutes when under an hour)."""
+    try:
+        then = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(ts)
+    minutes = int((datetime.now() - then).total_seconds() // 60)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours_total = minutes // 60
+    days, hours = divmod(hours_total, 24)
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    return " ".join(parts) + " ago"
+
+
+def user_display_names() -> dict:
+    """username -> 'First Last' for showing who wrote something."""
+    with db() as conn:
+        rows = conn.execute("SELECT username, fname, lname FROM users").fetchall()
+    return {r["username"]: f"{r['fname']} {r['lname']}".strip() or r["username"] for r in rows}
+
+
 def problems_section(df: pd.DataFrame):
     issues = df[df["problems"].fillna("").str.strip() != ""]
     st.subheader("⚠️ Problems & solutions")
     if issues.empty:
         st.success("No problems reported in this range.")
         return
+    names = user_display_names()
     for _, r in issues.iterrows():
+        # notes_by is who saved the Notes tab. Older reports only know who saved the report last.
+        author = r.get("notes_by") if isinstance(r.get("notes_by"), str) and r.get("notes_by") else None
+        when = r.get("notes_at") if author else r.get("timestamp")
+        who = author or r.get("supervisor") or "unknown"
+        label = "Posted by" if author else "Last saved by"
         with st.container(border=True):
             st.markdown(f"**🚨 {r['station']}** · {r['report_date']} · Shift {r['shift']}")
             st.write(f"**Problem:** {r['problems']}")
             st.write(f"**Solution:** {r['solution'] or '_No solution recorded_'}")
+            st.caption(f"✍️ {label} **{names.get(who, who)}** (@{who})" + (f" · {time_ago(when)}" if when else ""))
 
 
 def confirm_password_rules(new: str, confirm: str):
@@ -1137,11 +1226,13 @@ def submit_page():
         return st.text_area(label, value=(existing or {}).get(field) or "", height=90,
                             key=f"{prefix}_{field}")
 
-    def save_section(title: str, vals: dict):
+    def save_section(title: str, vals: dict, extra: dict = None):
         clean = {f: ((v or "").strip() if f in TEXT_FIELDS else (v or 0)) for f, v in vals.items()}
         if not existing and not any(clean.values()):
             st.error("Enter at least one value before saving.")
             return
+        if extra:
+            clean.update(extra)  # e.g. who wrote the notes, added after the empty check
         result = save_partial(station, report_date, shift, user["username"], clean, title, actor())
         if result in ("inserted", "updated"):
             st.success(f"✅ {title} saved.")
@@ -1233,7 +1324,7 @@ def submit_page():
             }
             go = st.form_submit_button("💾 Save notes", type="primary", use_container_width=True)
         if go:
-            save_section("Notes", v)
+            save_section("Notes", v, extra={"notes_by": user["username"], "notes_at": now_str()})
 
 
 def my_reports_page():
@@ -1580,6 +1671,524 @@ def backup_page():
     st.caption("To restore: stop the app, replace toll_operations.db with the backup file, and start the app again.")
 
 
+# ===================================================================
+# EQUIPMENT CRASH REPORTS
+# ===================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_crashes(station=None, start_date=None, end_date=None, status=None) -> pd.DataFrame:
+    """List query. Photos are NOT loaded here (they are large)."""
+    query = """SELECT id, report_date, report_time, station, shift, lane, equipment_type, equipment_detail,
+                      problem, severity, lane_closed, downtime_hours, reported_by, status, action_taken,
+                      resolved_by, resolved_at, created_at,
+                      (image_data IS NOT NULL AND image_data != '') AS has_image
+               FROM equipment_crashes WHERE 1=1"""
+    params = []
+    if station and station != ALL_STATIONS:
+        query += " AND station = ?"
+        params.append(station)
+    if status and status != "All":
+        query += " AND status = ?"
+        params.append(status)
+    if start_date:
+        query += " AND report_date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND report_date <= ?"
+        params.append(end_date)
+    query += " ORDER BY report_date DESC, report_time DESC, id DESC"
+    with db() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    df["has_image"] = df["has_image"].astype(bool)
+    return df
+
+
+def get_crash_image(crash_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT image_data FROM equipment_crashes WHERE id = ?", (crash_id,)).fetchone()
+    return row["image_data"] if row else None
+
+
+def show_crash_image(crash_id: int):
+    data = get_crash_image(crash_id)
+    if not data or len(data.strip()) < 100:
+        st.caption("📷 No photo")
+        return
+    try:
+        st.image(base64.b64decode(data), use_container_width=True)
+    except Exception:  # noqa: BLE001
+        st.caption("📷 Photo could not be displayed")
+
+
+def add_crash(rec: dict, who):
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT INTO equipment_crashes
+               (report_date, report_time, station, shift, lane, equipment_type, equipment_detail, problem,
+                severity, lane_closed, reported_by, status, image_data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+            (rec["report_date"], rec["report_time"], rec["station"], rec["shift"], rec["lane"],
+             rec["equipment_type"], rec["equipment_detail"], rec["problem"], rec["severity"],
+             1 if rec["lane_closed"] else 0, who[0], rec["image_data"]),
+        )
+        log_action(who, "CREATE_CRASH", "EQUIPMENT_CRASH", cur.lastrowid, rec["equipment_type"],
+                   f"{rec['severity']} crash: {rec['equipment_type']} ({rec['lane'] or 'no lane'}) - "
+                   f"{rec['problem'][:120]}", rec["station"], conn=conn)
+    st.cache_data.clear()
+
+
+def update_crash(crash_id, status, action_taken, downtime_hours, who, allowed_station=None):
+    """Update status and repair details. allowed_station limits a Station Manager to their own station."""
+    with db() as conn:
+        row = conn.execute("SELECT station, equipment_type FROM equipment_crashes WHERE id = ?",
+                           (crash_id,)).fetchone()
+        if not row:
+            return False, "Record not found"
+        if allowed_station and row["station"] != allowed_station:
+            return False, "You can only update crashes of your own station"
+        if status == "resolved":
+            conn.execute(
+                """UPDATE equipment_crashes SET status=?, action_taken=?, downtime_hours=?,
+                          resolved_by=?, resolved_at=?, updated_at=? WHERE id=?""",
+                (status, action_taken, downtime_hours, who[0], now_str(), now_str(), crash_id))
+        else:
+            conn.execute(
+                """UPDATE equipment_crashes SET status=?, action_taken=?, downtime_hours=?,
+                          resolved_by=NULL, resolved_at=NULL, updated_at=? WHERE id=?""",
+                (status, action_taken, downtime_hours, now_str(), crash_id))
+        log_action(who, "UPDATE_CRASH", "EQUIPMENT_CRASH", crash_id, row["equipment_type"],
+                   f"Crash #{crash_id} set to {status}", row["station"], conn=conn)
+    st.cache_data.clear()
+    return True, "Updated"
+
+
+def delete_crash(crash_id, who):
+    with db() as conn:
+        row = conn.execute("SELECT station, equipment_type FROM equipment_crashes WHERE id = ?",
+                           (crash_id,)).fetchone()
+        if not row:
+            return
+        conn.execute("DELETE FROM equipment_crashes WHERE id = ?", (crash_id,))
+        log_action(who, "DELETE_CRASH", "EQUIPMENT_CRASH", crash_id, row["equipment_type"],
+                   f"Deleted crash #{crash_id}", row["station"], conn=conn)
+    st.cache_data.clear()
+
+
+@st.dialog("Delete crash report")
+def confirm_delete_crash(crash_id: int, label: str):
+    st.warning(f"Permanently delete **{label}**? This cannot be undone.")
+    c1, c2 = st.columns(2)
+    if c1.button("Delete", type="primary", use_container_width=True):
+        delete_crash(crash_id, actor())
+        flash("Crash report deleted", "🗑️")
+        st.rerun()
+    if c2.button("Cancel", use_container_width=True):
+        st.rerun()
+
+
+def equipment_page():
+    user = current_user()
+    can_edit = can_manage(user)
+    header("🛠️ Equipment Crash Report",
+           "Report and track equipment failures" if is_admin(user) else f"Station: {user['station']}",
+           manager=can_edit)
+    list_tab, add_tab = st.tabs(["📋 Crash list", "➕ Report a crash"])
+
+    with list_tab:
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            start, end = date_range("eq_range", days=30)
+        status = c2.selectbox("Status", ["All"] + CRASH_STATUS, key="eq_status",
+                              format_func=lambda s: "All" if s == "All" else CRASH_STATUS_LABEL[s])
+        station = own_station(user)
+        if is_admin(user):
+            with c3:
+                station = station_filter(user, "eq_station")
+
+        df = get_crashes(station=station, start_date=start, end_date=end, status=status).reset_index(drop=True)
+        if df.empty:
+            st.info("No equipment crash reports for these filters.")
+        else:
+            m = st.columns(5)
+            m[0].metric("Reports", len(df))
+            m[1].metric("🔴 Open", int((df["status"] == "open").sum()))
+            m[2].metric("🟡 In progress", int((df["status"] == "in_progress").sum()))
+            m[3].metric("🟢 Resolved", int((df["status"] == "resolved").sum()))
+            m[4].metric("Downtime (h)", f"{df['downtime_hours'].fillna(0).sum():,.1f}")
+
+            view = df.assign(
+                Severity=df["severity"].map(lambda v: f"{SEVERITY_ICON.get(v, '')} {v}"),
+                Status=df["status"].map(CRASH_STATUS_LABEL),
+                lane_closed=df["lane_closed"].astype(bool),
+            )[["report_date", "report_time", "station", "lane", "equipment_type", "Severity",
+               "lane_closed", "Status", "downtime_hours", "has_image"]]
+            event = st.dataframe(
+                view, hide_index=True, use_container_width=True, on_select="rerun",
+                selection_mode="single-row", key="eq_table",
+                column_config={
+                    "report_date": "Date", "report_time": st.column_config.TextColumn("Time", width="small"),
+                    "station": "Station", "lane": "Lane / location", "equipment_type": "Equipment",
+                    "lane_closed": st.column_config.CheckboxColumn("Lane out", width="small"),
+                    "downtime_hours": st.column_config.NumberColumn("Downtime (h)", format="%.1f"),
+                    "has_image": st.column_config.CheckboxColumn("Photo", width="small"),
+                },
+            )
+            st.caption("Select a row to see details" + (" and update the repair status." if can_edit else "."))
+
+            rows = event.selection.rows
+            if rows:
+                row = df.iloc[rows[0]]
+                cid = int(row["id"])
+                with st.container(border=True):
+                    left, right = st.columns([2, 1])
+                    with left:
+                        st.subheader(f"{row['equipment_type']} · {row['station']}")
+                        st.write(f"**When:** {row['report_date']} {row['report_time'] or ''} · "
+                                 f"**Shift:** {row['shift'] or '-'} · **Lane / location:** {row['lane'] or '-'}")
+                        st.write(f"**Equipment details:** {row['equipment_detail'] or '-'}")
+                        st.write(f"**Severity:** {SEVERITY_ICON.get(row['severity'], '')} {row['severity']} · "
+                                 f"**Lane out of service:** {'Yes' if row['lane_closed'] else 'No'}")
+                        st.write(f"**Problem:** {row['problem']}")
+                        st.write(f"**Reported by:** {row['reported_by']}")
+                        st.write(f"**Status:** {CRASH_STATUS_LABEL[row['status']]}"
+                                 + (f" ({row['resolved_at']} by {row['resolved_by']})" if row["resolved_at"] else ""))
+                        if row["action_taken"]:
+                            st.write(f"**Action taken:** {row['action_taken']}")
+                    with right:
+                        if row["has_image"]:
+                            show_crash_image(cid)
+                        else:
+                            st.caption("📷 No photo")
+
+                    if can_edit:
+                        st.divider()
+                        with st.form(f"eq_update_{cid}"):
+                            u1, u2 = st.columns(2)
+                            new_status = u1.selectbox("Repair status", CRASH_STATUS,
+                                                      index=CRASH_STATUS.index(row["status"]),
+                                                      format_func=CRASH_STATUS_LABEL.get)
+                            downtime = u2.number_input("Downtime (hours)", min_value=0.0, step=0.5,
+                                                       value=float(row["downtime_hours"] or 0))
+                            action = st.text_area("Action taken / repair notes", value=row["action_taken"] or "")
+                            if st.form_submit_button("💾 Save update", type="primary", use_container_width=True):
+                                ok, msg = update_crash(cid, new_status, action.strip(), downtime, actor(),
+                                                       allowed_station=own_station(user))
+                                if ok:
+                                    flash(f"Crash #{cid} updated")
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                        if is_admin(user) and st.button("🗑️ Delete this report", key=f"eq_del_{cid}"):
+                            confirm_delete_crash(cid, f"{row['equipment_type']} ({row['report_date']})")
+
+            st.download_button("📥 Download CSV", df.drop(columns=["has_image"]).to_csv(index=False),
+                               "equipment_crashes.csv", mime="text/csv")
+
+    with add_tab:
+        with st.form("eq_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                if is_admin(user) or user["station"] == ALL_STATIONS:
+                    station_in = st.selectbox("Station", STATIONS)
+                else:
+                    station_in = user["station"]
+                    st.text_input("Station", value=station_in, disabled=True)
+                etype = st.selectbox("Equipment type", EQUIPMENT_TYPES)
+                lane = st.text_input("Lane / location", placeholder="e.g., Exit lane 2, Booth 3")
+                detail = st.text_input("Equipment name / serial number", placeholder="Optional")
+            with c2:
+                rdate = st.date_input("Date", value=date.today(), max_value=date.today())
+                rtime = st.time_input("Time of failure", value=datetime.now().time().replace(second=0, microsecond=0))
+                shift = st.selectbox("Shift", SHIFTS)
+                severity = st.selectbox("Severity", SEVERITIES, index=1)
+            lane_closed = st.checkbox("Lane is out of service because of this failure")
+            problem = st.text_area("What happened?", placeholder="Describe the failure and what you saw")
+            photo = st.file_uploader("📷 Photo (optional)", type=["jpg", "jpeg", "png"], key="eq_photo")
+
+            if st.form_submit_button("➕ Submit crash report", type="primary", use_container_width=True):
+                if not problem.strip():
+                    st.error("Please describe what happened.")
+                else:
+                    image_data, err = (None, None)
+                    if photo is not None:
+                        image_data, err = process_image(photo)
+                    if err:
+                        st.error(err)
+                    else:
+                        add_crash({
+                            "report_date": rdate.isoformat(), "report_time": rtime.strftime("%H:%M"),
+                            "station": station_in, "shift": shift, "lane": lane.strip(),
+                            "equipment_type": etype, "equipment_detail": detail.strip(),
+                            "problem": problem.strip(), "severity": severity,
+                            "lane_closed": lane_closed, "image_data": image_data,
+                        }, actor())
+                        flash(f"Crash report for {etype} submitted", "🛠️")
+                        st.rerun()
+
+
+# ===================================================================
+# STAKEHOLDER FOLLOW-UP LETTERS (Super Admin)
+# ===================================================================
+LETTER_TITLES = ["Mr.", "Ms.", "Dr.", "Eng.", "Ato", "W/ro", "(none)"]
+LETTER_STATUS = ["sent", "reminded", "replied", "closed"]
+LETTER_STATUS_LABEL = {"sent": "📨 Sent", "reminded": "🔔 Reminder sent",
+                       "replied": "✅ Replied", "closed": "📁 Closed"}
+FEEDBACK_QUESTIONS = [
+    "The reports and totals I receive are accurate.",
+    "The reports arrive on time after each shift and at month end.",
+    "The information I need (traffic, cash, fuel, paper, unpaid vehicles, equipment crashes) is complete.",
+    "The system is easy to understand and use.",
+    "The CSV downloads and summaries meet my needs.",
+    "Problems and solutions reported by the stations are clear and followed up.",
+    "Overall, I am satisfied with the system.",
+]
+
+
+def long_date(d) -> str:
+    return f"{d.day} {d:%B %Y}"
+
+
+def build_letter(kind: str, f: dict):
+    """Returns (subject, body). kind is 'first' or 'reminder'. f holds the letter details."""
+    who = f["name"] if f["title"] in ("", "(none)") else f"{f['title']} {f['name']}"
+    plazas = ", ".join(STATIONS[:-1]) + " and " + STATIONS[-1]
+    sign = [f["sender_name"]] + ([f["sender_position"]] if f["sender_position"] else []) + \
+           ([f["sender_contact"]] if f["sender_contact"] else [])
+    contact = f["sender_contact"] or "the sender"
+    if kind == "reminder":
+        first = f"our request of {long_date(f['first_sent'])}" if f.get("first_sent") else "our earlier request"
+        subject = "Reminder: feedback on the Toll Operations Manager system"
+        body = [
+            f"Dear {who},", "",
+            f"This is a friendly reminder about {first} for your feedback on the Toll Operations Manager "
+            "system used at our toll plazas.", "",
+            f"Your answers by {long_date(f['reply_by'])} would help us decide the next improvements. "
+            "If you prefer, we can call you or meet at a time that suits you.", "",
+            "Thank you for your time and support.", "",
+            "Yours sincerely,", "", *sign,
+        ]
+        return subject, "\n".join(body)
+
+    subject = "Request for feedback on the Toll Operations Manager system"
+    questions = [f"{i}. {q}" for i, q in enumerate(FEEDBACK_QUESTIONS, 1)]
+    body = [
+        f"Dear {who},", "",
+        f"Since {long_date(f['golive'])}, the five toll plazas ({plazas}) have been recording their shift "
+        "reports in the new Toll Operations Manager system. It records traffic, cash, thermal paper, "
+        "generator and vehicle fuel, unpaid vehicles and equipment crashes, and station managers settle "
+        "each shift.", "",
+        "Your views matter to us. We would like to know how the system works for you and what should be "
+        "improved. Please review the reports and figures you receive and tell us about:", "",
+        "1. Whether the figures you need are complete, accurate and on time",
+        "2. Anything that is unclear, missing or hard to use",
+        "3. Problems you noticed, such as wrong totals or delays in settling shifts",
+        "4. Changes or new reports you would like us to add", "",
+        "Please rate each statement below from 1 (poor) to 5 (excellent) and add a comment where you can:", "",
+        *questions, "",
+        "Open questions: What is the most useful thing the system does for you? What is the biggest "
+        "problem or missing feature? What one change would help you most?", "",
+        f"Please send your answers by {long_date(f['reply_by'])} to {contact}. We are also happy to meet or "
+        "call you for 20 to 30 minutes instead, if that is easier.", "",
+        "We will review all feedback, tell you what we will change and when, and confirm back to you once "
+        "it is done.", "",
+        "Thank you for your time and support.", "",
+        "Yours sincerely,", "", *sign,
+    ]
+    return subject, "\n".join(body)
+
+
+def get_letters() -> pd.DataFrame:
+    with db() as conn:
+        return pd.read_sql_query("SELECT * FROM stakeholder_letters ORDER BY id DESC", conn)
+
+
+def save_letter_sent(rec_id, name, position, org, email, kind, who) -> int:
+    """Create the stakeholder record, or update it, after a letter is sent."""
+    today = date.today().isoformat()
+    with db() as conn:
+        if rec_id:
+            if kind == "reminder":
+                conn.execute(
+                    """UPDATE stakeholder_letters SET stakeholder_name=?, position=?, organization=?, email=?,
+                              reminder_sent_date=?, updated_at=?,
+                              status=CASE WHEN status IN ('replied','closed') THEN status ELSE 'reminded' END
+                       WHERE id=?""", (name, position, org, email, today, now_str(), rec_id))
+            else:
+                conn.execute(
+                    """UPDATE stakeholder_letters SET stakeholder_name=?, position=?, organization=?, email=?,
+                              letter_sent_date=?, status='sent', updated_at=? WHERE id=?""",
+                    (name, position, org, email, today, now_str(), rec_id))
+            log_action(who, "UPDATE_LETTER", "STAKEHOLDER", rec_id, name,
+                       f"Marked {'reminder' if kind == 'reminder' else 'first letter'} as sent to {name}", conn=conn)
+            return rec_id
+        if kind == "reminder":
+            cur = conn.execute(
+                """INSERT INTO stakeholder_letters (stakeholder_name, position, organization, email,
+                          reminder_sent_date, status, created_by) VALUES (?, ?, ?, ?, ?, 'reminded', ?)""",
+                (name, position, org, email, today, who[0]))
+        else:
+            cur = conn.execute(
+                """INSERT INTO stakeholder_letters (stakeholder_name, position, organization, email,
+                          letter_sent_date, status, created_by) VALUES (?, ?, ?, ?, ?, 'sent', ?)""",
+                (name, position, org, email, today, who[0]))
+        log_action(who, "CREATE_LETTER", "STAKEHOLDER", cur.lastrowid, name,
+                   f"Letter sent to {name} ({position or org or 'stakeholder'})", conn=conn)
+        return cur.lastrowid
+
+
+def update_letter_reply(rec_id, status, reply_date, summary, action, who):
+    with db() as conn:
+        row = conn.execute("SELECT stakeholder_name FROM stakeholder_letters WHERE id=?", (rec_id,)).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            """UPDATE stakeholder_letters SET status=?, reply_date=?, reply_summary=?, action_agreed=?,
+                      updated_at=? WHERE id=?""",
+            (status, reply_date, summary, action, now_str(), rec_id))
+        log_action(who, "UPDATE_LETTER", "STAKEHOLDER", rec_id, row["stakeholder_name"],
+                   f"Status set to {status}", conn=conn)
+    return True
+
+
+def letters_page():
+    user = current_user()
+    header("📨 Stakeholder Letters", "Write follow-up letters asking stakeholders for feedback and track replies",
+           manager=True)
+    if not is_admin(user):
+        st.error("Only a Super Admin can use this page.")
+        return
+
+    write_tab, track_tab = st.tabs(["✍️ Write letter", "📋 Tracking"])
+    letters = get_letters()
+
+    with write_tab:
+        options = {"New stakeholder": None}
+        for r in letters.itertuples():
+            options[f"{r.stakeholder_name}" + (f" ({r.organization})" if r.organization else "")] = int(r.id)
+        choice = st.selectbox("Stakeholder", list(options),
+                              help="Pick someone from the tracking list to send a reminder, or add a new one.")
+        rec_id = options[choice]
+        rec = letters[letters["id"] == rec_id].iloc[0] if rec_id else None
+        k = f"sl_{rec_id or 'new'}"
+        val = lambda col: ("" if rec is None or pd.isna(rec[col]) else str(rec[col]))
+
+        kind_label = st.radio("Letter", ["First request", "Reminder"], horizontal=True,
+                              index=1 if (rec is not None and rec["status"] in ("sent", "reminded")) else 0)
+        kind = "reminder" if kind_label == "Reminder" else "first"
+
+        c1, c2 = st.columns(2)
+        with c1:
+            title = st.selectbox("Title", LETTER_TITLES, key=f"{k}_title")
+            name = st.text_input("Stakeholder name", value=val("stakeholder_name"), key=f"{k}_name")
+            position = st.text_input("Position", value=val("position"), key=f"{k}_pos")
+            org = st.text_input("Department / organization", value=val("organization"), key=f"{k}_org")
+            email = st.text_input("Email (optional)", value=val("email"), key=f"{k}_email")
+        with c2:
+            sender_name = st.text_input("Sender name", value=display_name(user), key="sl_sender")
+            sender_pos = st.text_input("Sender position", key="sl_sender_pos")
+            sender_contact = st.text_input("Sender phone / email", key="sl_sender_contact")
+            golive = st.date_input("Go-live date", value=date.today() - timedelta(days=14), key="sl_golive")
+            reply_by = st.date_input("Reply by", value=date.today() + timedelta(days=7), key="sl_replyby")
+        first_sent = None
+        if kind == "reminder" and rec is not None and val("letter_sent_date"):
+            first_sent = date.fromisoformat(val("letter_sent_date"))
+
+        subject, body = build_letter(kind, {
+            "title": title, "name": name or "[Name]", "sender_name": sender_name or "[Your name]",
+            "sender_position": sender_pos, "sender_contact": sender_contact,
+            "golive": golive, "reply_by": reply_by, "first_sent": first_sent,
+        })
+        header_lines = [f"Date: {long_date(date.today())}", ""]
+        if name:
+            header_lines += [f"To: {name}" + (f", {position}" if position else ""),
+                             *([org] if org else []), ""]
+        header_lines += [f"Subject: {subject}", ""]
+        full = "\n".join(header_lines) + body
+
+        st.markdown("**Letter**: you can edit the text before copying or downloading it.")
+        text = st.text_area("Letter text", value=full, height=520, label_visibility="collapsed",
+                            key=f"letter_text_{hashlib.md5(full.encode()).hexdigest()}")
+
+        b1, b2, b3 = st.columns(3)
+        b1.download_button("📥 Download letter (.txt)", text.encode("utf-8"),
+                           f"stakeholder_letter_{(name or 'draft').replace(' ', '_')}.txt",
+                           mime="text/plain", use_container_width=True)
+        if email.strip():
+            from urllib.parse import quote
+            b2.link_button("✉️ Open in email app", f"mailto:{email.strip()}?subject={quote(subject)}&body={quote(body)}",
+                           use_container_width=True)
+        else:
+            b2.button("✉️ Open in email app", disabled=True, use_container_width=True,
+                      help="Enter the stakeholder's email to use this.")
+        if b3.button("💾 Mark as sent and track", type="primary", use_container_width=True):
+            if not name.strip():
+                st.error("Enter the stakeholder's name first.")
+            else:
+                save_letter_sent(rec_id, name.strip(), position.strip(), org.strip(), email.strip(), kind, actor())
+                flash(f"Letter to {name.strip()} saved in tracking", "📨")
+                st.rerun()
+        if email.strip() and len(body) > 1500:
+            st.caption("This letter is long, so some email apps may cut it. If so, copy the text above instead.")
+
+    with track_tab:
+        if letters.empty:
+            st.info("No letters tracked yet. Write a letter and press 'Mark as sent and track'.")
+        else:
+            today = date.today()
+            def waiting(r):
+                if r["status"] not in ("sent", "reminded") or not r["letter_sent_date"]:
+                    return None
+                try:
+                    return (today - date.fromisoformat(str(r["letter_sent_date"]))).days
+                except ValueError:
+                    return None
+            view = letters.assign(
+                Status=letters["status"].map(LETTER_STATUS_LABEL),
+                days_waiting=letters.apply(waiting, axis=1),
+            )
+            m = st.columns(4)
+            m[0].metric("Stakeholders", len(letters))
+            m[1].metric("Waiting for reply", int(letters["status"].isin(["sent", "reminded"]).sum()))
+            m[2].metric("Replied", int((letters["status"] == "replied").sum()))
+            m[3].metric("Reminder due (7+ days)",
+                        int(((view["days_waiting"].fillna(0) >= 7) & (letters["status"] == "sent")).sum()))
+            event = st.dataframe(
+                view[["stakeholder_name", "position", "organization", "letter_sent_date", "reminder_sent_date",
+                      "reply_date", "days_waiting", "Status"]],
+                hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
+                key="letters_table",
+                column_config={"stakeholder_name": "Stakeholder", "position": "Position",
+                               "organization": "Organization", "letter_sent_date": "Letter sent",
+                               "reminder_sent_date": "Reminder sent", "reply_date": "Reply received",
+                               "days_waiting": st.column_config.NumberColumn("Days waiting", format="%d")},
+            )
+            rows = event.selection.rows
+            if not rows:
+                st.caption("Select a stakeholder to record their reply.")
+            else:
+                r = letters.iloc[rows[0]]
+                rid = int(r["id"])
+                with st.container(border=True):
+                    st.subheader(r["stakeholder_name"])
+                    with st.form(f"letter_reply_{rid}"):
+                        c1, c2 = st.columns(2)
+                        status = c1.selectbox("Status", LETTER_STATUS, index=LETTER_STATUS.index(r["status"]),
+                                              format_func=LETTER_STATUS_LABEL.get)
+                        existing_reply = r["reply_date"] if isinstance(r["reply_date"], str) and r["reply_date"] else None
+                        reply_date = c2.date_input("Reply received on",
+                                                   value=date.fromisoformat(existing_reply) if existing_reply else date.today())
+                        summary = st.text_area("Main points of their feedback",
+                                               value=r["reply_summary"] if isinstance(r["reply_summary"], str) else "")
+                        action = st.text_area("Action agreed",
+                                              value=r["action_agreed"] if isinstance(r["action_agreed"], str) else "")
+                        if st.form_submit_button("💾 Save", type="primary", use_container_width=True):
+                            update_letter_reply(rid, status, reply_date.isoformat() if status in ("replied", "closed") else None,
+                                                summary.strip(), action.strip(), actor())
+                            flash("Tracking updated")
+                            st.rerun()
+            st.download_button("📥 Download tracking list (CSV)", letters.to_csv(index=False),
+                               "stakeholder_letters.csv", mime="text/csv")
+
+
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
 
 
@@ -1743,6 +2352,8 @@ def users_page():
 
 ACTION_ICONS = [
     ("BACKUP", "💾"),
+    ("LETTER", "📨"),
+    ("CRASH", "🛠️"),
     ("LOGIN_FAILED", "⚠️"), ("LOGIN", "🔑"), ("LOGOUT", "🚪"), ("CHANGE_PASSWORD", "🔐"),
     ("UNSETTLE", "🔓"), ("SETTLE", "🔒"), ("DEACTIVATE", "⛔"), ("ACTIVATE", "✅"),
     ("DELETE", "🗑️"), ("CREATE", "➕"), ("UPDATE", "✏️"),
@@ -1751,6 +2362,8 @@ AUDIT_ACTIONS = [
     "LOGIN", "LOGOUT", "LOGIN_FAILED", "CREATE_USER", "UPDATE_USER", "ACTIVATE_USER", "DEACTIVATE_USER",
     "CHANGE_PASSWORD", "CREATE_REPORT", "UPDATE_REPORT", "SETTLE_REPORT", "UNSETTLE_REPORT",
     "CREATE_UNPAID", "UPDATE_UNPAID_STATUS", "DELETE_UNPAID", "BACKUP_CREATE", "BACKUP_DOWNLOAD",
+    "CREATE_CRASH", "UPDATE_CRASH", "DELETE_CRASH",
+    "CREATE_LETTER", "UPDATE_LETTER",
 ]
 
 
@@ -1803,6 +2416,7 @@ def build_pages(user):
     P = st.Page
     dash = P(dashboard_page, title="Dashboard", icon="📊", url_path="dashboard", default=True)
     unpaid = P(unpaid_page, title="Unpaid Vehicles", icon="🚫", url_path="unpaid")
+    crash = P(equipment_page, title="Equipment Crash", icon="🛠️", url_path="equipment")
     if is_admin(user):
         return {
             "Overview": [
@@ -1815,11 +2429,13 @@ def build_pages(user):
                 P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
                 P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
                 unpaid,
+                crash,
             ],
             "Admin": [
                 P(users_page, title="Users", icon="👥", url_path="users"),
                 P(audit_log_page, title="Audit Log", icon="🧾", url_path="audit"),
                 P(backup_page, title="Database Backup", icon="💾", url_path="backup"),
+                P(letters_page, title="Stakeholder Letters", icon="📨", url_path="letters"),
             ],
         }
     if user["role"] in (ROLE_STATION, ROLE_ADMIN):  # ROLE_ADMIN here = tied to one station
@@ -1834,6 +2450,7 @@ def build_pages(user):
                 P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
                 P(settle_page, title="Settle Shifts", icon="🔒", url_path="settle"),
                 unpaid,
+                crash,
             ],
         }
     return [
@@ -1841,6 +2458,7 @@ def build_pages(user):
         P(submit_page, title="Submit Report", icon="📝", url_path="submit"),
         P(my_reports_page, title="My Reports", icon="📋", url_path="my-reports"),
         unpaid,
+        crash,
     ]
 
 
