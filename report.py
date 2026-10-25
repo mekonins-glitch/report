@@ -325,8 +325,13 @@ def setup_database():
             )
 
 
+# Bump this number whenever tables or columns are added. It is part of the cache key below, so the
+# database setup runs again on the next start even if the server process was not restarted.
+SCHEMA_VERSION = 7
+
+
 @st.cache_resource
-def init_once(schema_version: int = 6):
+def init_once(schema_version: int):
     setup_database()
     return True
 
@@ -2463,7 +2468,7 @@ def build_pages(user):
 
 
 def main():
-    init_once()
+    init_once(SCHEMA_VERSION)
     user = current_user()
     if user is None:
         login_view()
