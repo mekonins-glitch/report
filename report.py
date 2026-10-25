@@ -327,7 +327,24 @@ def setup_database():
 
 # Bump this number whenever tables or columns are added. It is part of the cache key below, so the
 # database setup runs again on the next start even if the server process was not restarted.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+
+REQUIRED_TABLES = {"users", "reports", "unpaid_vehicles", "audit_log",
+                   "equipment_crashes", "stakeholder_letters"}
+
+
+def ensure_schema():
+    """Self-heal: runs on every page load. If the database file was replaced (restore, new
+    server, wiped disk) and tables are missing, create them again."""
+    try:
+        with db() as conn:
+            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not REQUIRED_TABLES <= have:
+            setup_database()
+            st.cache_data.clear()
+    except sqlite3.Error:
+        setup_database()
 
 
 @st.cache_resource
@@ -2512,6 +2529,7 @@ def build_pages(user):
 
 def main():
     init_once(SCHEMA_VERSION)
+    ensure_schema()
     user = current_user()
     if user is None:
         login_view()
