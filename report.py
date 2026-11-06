@@ -2320,6 +2320,73 @@ def crv_page():
 
 
 # ===================================================================
+# MISSING REPORTS (which station / shift has no data entered)
+# ===================================================================
+def missing_grid(start: str, end: str, station) -> pd.DataFrame:
+    """One row per date x station x shift with Entered / Empty / Missing."""
+    stations = [station] if station else STATIONS
+    days = pd.date_range(start, end).strftime("%Y-%m-%d").tolist()
+    rep = get_reports(station=station, start_date=start, end_date=end)
+    have = {}
+    if not rep.empty:
+        rep = rep.assign(tot_traffic=rep[TRAFFIC_COLS].fillna(0).sum(axis=1),
+                         tot_rev=rep[REVENUE_COLS].fillna(0).sum(axis=1))
+        for r in rep.itertuples():
+            have[(r.station, r.report_date, r.shift)] = (r.tot_traffic, r.tot_rev, r.supervisor, bool(r.is_settled))
+    rows = []
+    for d in days:
+        for s in stations:
+            for sh in SHIFTS:
+                got = have.get((s, d, sh))
+                if got is None:
+                    state, who = "❌ Missing", ""
+                elif got[0] == 0 and got[1] == 0:
+                    state, who = "⚠️ Empty (no traffic, no cash)", got[2] or ""
+                else:
+                    state, who = "✅ Entered", got[2] or ""
+                rows.append({"Date": d, "Station": s, "Shift": sh, "Result": state, "Supervisor": who})
+    return pd.DataFrame(rows)
+
+
+def missing_page():
+    user = current_user()
+    header("🚨 Missing Reports", "Stations and shifts with no data entered", manager=True)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        start, end = date_range("miss_range", days=7)
+    with c2:
+        station = station_filter(user, "miss_station")
+    grid = missing_grid(start, end, station)
+    bad = grid[grid["Result"] != "✅ Entered"]
+    total = len(grid)
+    m = st.columns(4)
+    m[0].metric("Expected shift reports", f"{total:,}")
+    m[1].metric("✅ Entered", f"{total - len(bad):,}")
+    m[2].metric("❌ Missing", int((grid["Result"] == "❌ Missing").sum()))
+    m[3].metric("⚠️ Empty", int(grid["Result"].str.startswith("⚠️").sum()))
+    if date.today().isoformat() <= end:
+        st.caption("Today's later shifts may still be running, so they can show as missing until they are entered.")
+
+    if bad.empty:
+        st.success("All shifts have data for this period.")
+        return
+
+    st.subheader("Missing by station")
+    summ = (bad.assign(Missing=1).pivot_table(index="Station", columns="Shift", values="Missing",
+                                                aggfunc="sum", fill_value=0)
+            .reindex(columns=SHIFTS, fill_value=0))
+    summ["Total"] = summ.sum(axis=1)
+    st.dataframe(summ.reset_index(), hide_index=True, use_container_width=True)
+
+    st.subheader("Full list")
+    only = st.radio("Show", ["All problems", "❌ Missing only"], horizontal=True, key="miss_only")
+    shown = bad if only == "All problems" else bad[bad["Result"] == "❌ Missing"]
+    shown = shown.sort_values(["Date", "Station", "Shift"], ascending=[False, True, True])
+    st.dataframe(shown, hide_index=True, use_container_width=True)
+    st.download_button("📥 Download CSV", shown.to_csv(index=False), "missing_reports.csv", mime="text/csv")
+
+
+# ===================================================================
 # STAKEHOLDER FOLLOW-UP LETTERS (Super Admin)
 # ===================================================================
 LETTER_TITLES = ["Mr.", "Ms.", "Dr.", "Eng.", "Ato", "W/ro", "(none)"]
@@ -2819,6 +2886,7 @@ def build_pages(user):
                 P(analytics_page, title="Analytics", icon="📈", url_path="analytics"),
                 P(consolidated_page, title="Consolidated", icon="📋", url_path="consolidated"),
                 P(station_reports_page, title="Station Reports", icon="🏢", url_path="station-reports"),
+                P(missing_page, title="Missing Reports", icon="🚨", url_path="missing"),
             ],
             "Operations": [
                 P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
@@ -2841,6 +2909,7 @@ def build_pages(user):
                 P(analytics_page, title="Analytics", icon="📈", url_path="analytics"),
                 P(consolidated_page, title="Consolidated", icon="📋", url_path="consolidated"),
                 P(station_reports_page, title="Station Reports", icon="🏢", url_path="station-reports"),
+                P(missing_page, title="Missing Reports", icon="🚨", url_path="missing"),
             ],
             "Operations": [
                 P(reports_page, title="Reports", icon="🗂️", url_path="reports"),
